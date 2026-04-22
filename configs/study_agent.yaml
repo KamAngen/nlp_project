@@ -1,0 +1,14 @@
+project_root: ..
+memory_root: memory/agent_memory
+report_root: reports/user_reports
+question_bank_path: data/legal_study_agent/question_bank.jsonl
+case_bank_path: data/legal_study_agent/case_bank.jsonl
+common_knowledge_path: data/legal_study_agent/common_knowledge.jsonl
+system_memory_path: data/legal_study_agent/system_seed_memories.json
+study_manifest_path: artifacts/study_knowledge_manifest.json
+use_legacy_statute_rag: true
+legacy_config_path: configs/defaults.yaml
+retrieval_top_k: 6
+default_exam_question_count: 5
+planner_backend: llm_react
+turn_analysis_mode: heuristic

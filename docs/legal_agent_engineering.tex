@@ -1,0 +1,303 @@
+\documentclass[12pt]{ctexart}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{float}
+
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2em}
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  backgroundcolor=\color{gray!8}
+}
+
+\title{统一法律学习 Agent 工程说明书}
+\author{面向三人协作的单一 Agent 架构说明}
+\date{2026 年 4 月}
+
+\begin{document}
+\maketitle
+
+\section{文档目标}
+
+本文档描述当前仓库已经落地的新版工程，而不是旧的双 Agent 过渡版本。当前系统的核心目标是：使用一个统一的本地 Agent，同步覆盖法规问答、法考学习、用户画像、用户会话、模拟测试、评分反馈和学习报告。
+
+本文档重点说明以下问题：
+
+\begin{enumerate}
+  \item 为什么要从两套 Agent 收敛为单一 Agent。
+  \item 统一运行时、统一工具层和统一 UI 的边界是什么。
+  \item 用户画像、会话和考试状态如何持久化。
+  \item 当前训练数据如何覆盖法律问答与学习场景。
+  \item 当前系统已经完成了哪些验证。
+\end{enumerate}
+
+\section{总体设计原则}
+
+本轮重构遵循四个原则：
+
+\begin{enumerate}
+  \item 只保留一个对外部署的 Agent，不再维持旧法律问答 Agent 与新学习型 Agent 并行。
+  \item 保留旧法规 RAG 和旧 ReAct 引擎中已经验证有效的部分，避免推倒重来。
+  \item 学习能力必须进入统一工具链，而不是停留在 UI 侧或规则分支中。
+  \item UI 只保留一个工作台界面，所有用户动作最终都回到统一 Agent 主链。
+\end{enumerate}
+
+\section{当前总体架构}
+
+当前系统可以理解为四层：
+
+\begin{enumerate}
+  \item \textbf{Context Layer}：用户画像、会话状态、系统记忆、工作记忆、事件记忆、语义记忆。
+  \item \textbf{Knowledge Layer}：法规知识库、题库、案例库、常识库。
+  \item \textbf{Runtime Layer}：基于 ReAct 的统一 Agent 主链与统一工具注册层。
+  \item \textbf{Product Layer}：CLI、单页 Web UI、训练数据构造与评测脚本。
+\end{enumerate}
+
+目录映射关系如下：
+
+\begin{table}[H]
+\centering
+\begin{tabular}{p{0.28\textwidth}p{0.60\textwidth}}
+\toprule
+目录 & 职责 \\
+\midrule
+\texttt{src/context\_engine} & 用户画像、会话状态、记忆命中与持久化。 \\
+\texttt{src/rag\_engine} & 题库、案例库、常识库加载与检索，兼容旧法规 RAG。 \\
+\texttt{src/legal\_agent/agent} & ReAct 状态机、解析、提示词和工具调度。 \\
+\texttt{src/legal\_agent/unified\_agent.py} & 单一 Agent 入口，负责统一上下文装配、模型调用与工具兜底。 \\
+\texttt{src/legal\_agent/unified\_tools.py} & 旧法律工具与学习工具的统一注册层。 \\
+\texttt{src/legal\_agent/web} & 单页工作台 UI。 \\
+\texttt{src/legal\_agent/training} & 统一训练数据构造、轨迹渲染与 QLoRA 训练。 \\
+\bottomrule
+\end{tabular}
+\caption{统一法律学习 Agent 的模块边界}
+\end{table}
+
+\section{统一运行时设计}
+
+\subsection{为什么选旧 ReAct 引擎作为主链}
+
+旧的 \texttt{LegalAgentEngine} 已经具备以下能力：
+
+\begin{enumerate}
+  \item 多轮 Thought / Action / Observation / Final Answer 状态机。
+  \item 自动格式纠错与重复工具调用抑制。
+  \item 事实不足时的追问机制。
+  \item 工具失败后的重新规划能力。
+\end{enumerate}
+
+因此当前工程没有再保留第二套学习型编排器，而是直接把学习场景能力作为新工具接入该状态机。
+
+\subsection{统一工具层}
+
+统一工具层位于 \texttt{src/legal\_agent/unified\_tools.py}。它把两类工具合并到一个 registry 中：
+
+\begin{enumerate}
+  \item 旧法律工具：\texttt{retrieve\_from\_kb}、\texttt{lookup\_statute}、\texttt{resolve\_hierarchy}、\texttt{calculator}、\texttt{ask\_user}。
+  \item 学习工具：\texttt{memory\_search}、\texttt{profile\_upsert}、\texttt{profile\_view}、\texttt{rag\_search}、\texttt{generate\_exam}、\texttt{score\_exam}、\texttt{generate\_report}。
+\end{enumerate}
+
+这样做的结果是：模型不再需要知道“这是哪个 Agent”，它只需要根据当前任务选择合适工具。
+
+\subsection{真实运行时的稳定性补丁}
+
+在真实模型冒烟中发现一个重要问题：基础模型可能直接输出 Final Answer，而不主动调用任何工具。为避免前端收到完全无证据的回答，当前统一 Agent 增加了 direct fallback 保护：
+
+\begin{enumerate}
+  \item 普通法律/学习问答：至少补 \texttt{memory\_search + rag\_search}。
+  \item 答题卡：至少补 \texttt{score\_exam + generate\_report}。
+  \item 组卷请求：至少补 \texttt{generate\_exam}。
+  \item 报告请求：至少补 \texttt{generate\_report}。
+  \item 画像更新：至少补 \texttt{profile\_upsert + profile\_view}。
+\end{enumerate}
+
+这个补丁不是替代 LM 规划，而是在线上保障最基本的证据链存在。
+
+\section{用户画像、会话和报告持久化}
+
+当前持久化由 \texttt{DiskMemoryStore} 与 \texttt{MemoryManager} 完成，默认根目录已经从旧的 \texttt{outputs/agent\_memory} 调整到：
+
+\begin{lstlisting}[language=bash]
+memory/agent_memory/
+├── system/
+│   └── system_memories.jsonl
+└── users/
+    └── {user_id}/
+        ├── profile.json
+        ├── memories.jsonl
+        └── sessions/
+            ├── {session_id}.json
+            └── ...
+\end{lstlisting}
+
+每个会话文件会记录：
+
+\begin{enumerate}
+  \item 对话轮次。
+  \item 会话摘要。
+  \item 当前激活考试编号。
+  \item 最近一次报告路径。
+\end{enumerate}
+
+学习报告默认输出到：
+
+\begin{lstlisting}[language=bash]
+reports/user_reports/
+\end{lstlisting}
+
+\section{统一 Web UI}
+
+\subsection{为什么不再保留双标签页}
+
+双标签页虽然短期上便于过渡，但长期会带来两个问题：
+
+\begin{enumerate}
+  \item 用户无法理解何时应该在法规问答页操作，何时应该切到法考学习页。
+  \item 同一个用户的会话、画像和测试状态被分散在两个交互面板中，产品逻辑割裂。
+\end{enumerate}
+
+因此当前界面改为单页工作台，统一展示：
+
+\begin{enumerate}
+  \item 模型选择。
+  \item 检索设备选择。
+  \item 模型设备选择。
+  \item 用户与会话管理。
+  \item 测试生成按钮。
+  \item 报告生成按钮。
+  \item Agent Trace。
+  \item 聊天区。
+  \item 报告区与下载入口。
+\end{enumerate}
+
+\subsection{当前 UI 交互约束}
+
+当前产品约束如下：
+
+\begin{enumerate}
+  \item 用户不能直接点击“查看当前画像”；画像应通过当前会话摘要和学习报告体现。
+  \item 模拟测试和学习报告仍然是按钮入口，因为这两类动作属于结构化产品动作，不希望和普通聊天混淆。
+  \item 右侧面板同时承担聊天与报告展示职责，避免把报告路径塞回聊天区。
+\end{enumerate}
+
+\section{训练与输出目录}
+
+\subsection{为什么训练目录改到 \texttt{ckpt}}
+
+旧工程把 LoRA 输出放在 \texttt{outputs/qlora\_agent}。当前工程改成：
+
+\begin{lstlisting}[language=bash]
+ckpt/unified_agent_qlora/
+\end{lstlisting}
+
+原因如下：
+
+\begin{enumerate}
+  \item \texttt{outputs} 更适合放评测结果、案例报告、临时运行产物。
+  \item \texttt{ckpt} 更符合训练 checkpoint 的目录语义。
+  \item UI 的模型扫描逻辑已经同步支持扫描 \texttt{ckpt} 下的 adapter。
+\end{enumerate}
+
+\subsection{统一训练数据}
+
+当前训练数据构造已经不再只覆盖旧法律问答样本，而是同时加入本地学习场景轨迹，包括：
+
+\begin{enumerate}
+  \item 画像更新。
+  \item 学习问答。
+  \item 案例讲解。
+  \item 法条型学习问答。
+  \item 模拟测试生成。
+  \item 测试评分。
+  \item 学习报告生成。
+\end{enumerate}
+
+这部分逻辑位于：
+
+\begin{enumerate}
+  \item \texttt{src/legal\_agent/training/dataset\_builder.py}
+  \item \texttt{src/legal\_agent/training/trajectory\_builder.py}
+\end{enumerate}
+
+\section{关键配置解释}
+
+\subsection{\texttt{planner\_backend}}
+
+当前 \texttt{configs/study\_agent.yaml} 中默认设置：
+
+\begin{lstlisting}[language=bash]
+planner_backend: llm_react
+\end{lstlisting}
+
+这表示统一 Agent 的主规划链仍是语言模型驱动，而不是纯规则硬编码。
+
+\subsection{\texttt{turn\_analysis\_mode}}
+
+当前默认设置：
+
+\begin{lstlisting}[language=bash]
+turn_analysis_mode: heuristic
+\end{lstlisting}
+
+这是一个稳定性优化。它避免在每轮刚开始时先额外调用一次模型做 turn analysis，从而减少 UI 停在“正在读取问题并规划下一步”的风险。需要更强的首轮语言模型分析时，可以改成 \texttt{llm}。
+
+\section{验证结果}
+
+\subsection{单元测试}
+
+当前核心回归测试为：
+
+\begin{lstlisting}[language=bash]
+PYTHONPATH=src python -m pytest \
+  tests/test_context_engine.py \
+  tests/test_study_tools.py \
+  tests/test_study_agent.py \
+  tests/test_web_study_workspace.py \
+  tests/test_web_app.py
+\end{lstlisting}
+
+本轮重构后的结果为：12 项测试全部通过。
+
+\subsection{真实模型验证}
+
+已经用本地 \texttt{models/qwen/Qwen3\_4B} 做过真实统一 Agent 冒烟，验证结论如下：
+
+\begin{enumerate}
+  \item 统一 Agent 不再卡在“正在读取问题并规划下一步”。
+  \item 基础模型即使直接裸答，统一 Agent 也会自动补成 \texttt{memory\_search + rag\_search} 回退链路。
+  \item 在同一 Agent 实例里已经验证画像更新、模拟测试、评分、学习报告可以连续执行。
+\end{enumerate}
+
+\subsection{真实 UI 验证}
+
+已经真实启动 Web UI，并确认：
+
+\begin{enumerate}
+  \item 页面标题为“统一法律学习 Agent”。
+  \item 页面存在模型、检索设备、模型设备、用户、会话、生成测试、生成报告、Trace、报告下载等关键入口。
+  \item 页面不再出现旧文案“法规问答 Agent”“法考学习工作台”“查看当前画像”。
+\end{enumerate}
+
+\section{后续协作建议}
+
+\begin{enumerate}
+  \item 组员 1 继续围绕 \texttt{context\_engine} 提高画像抽取、长期记忆筛选和报告快照质量。
+  \item 组员 2 继续围绕统一轨迹数据和 \texttt{ckpt/unified\_agent\_qlora} 做训练与评测闭环。
+  \item 组员 3 继续围绕 \texttt{web/unified\_workspace.py} 打磨交互细节和真实页面体验。
+\end{enumerate}
+
+\section{结论}
+
+当前工程已经从“两个 Agent 临时共存”的阶段，进入“一个统一 Agent + 一个统一工作台 + 一套统一训练链路”的阶段。后续所有功能增强都应继续围绕这条单一主链展开，而不应再恢复双运行时结构。
+
+\end{document}

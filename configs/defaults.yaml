@@ -1,0 +1,78 @@
+project_root: ..
+law_dir: data/law_files
+law_doc_dir: data/law_files/files
+law_catalog_glob: catalogs/law_catalog_master.csv
+artifact_root: artifacts
+disc_law_dir: data/disc_law
+generated_data_dir: data/generated
+output_root: outputs
+available_gpu_ids:
+  - 1
+  - 2
+  - 4
+  - 6
+models:
+  agent_base: models/qwen/Qwen3_4B
+  embedding_model: models/embeddings/bge-small-zh
+retrieval:
+  max_chunk_chars: 900
+  chunk_overlap_chars: 120
+  dense_top_k: 12
+  bm25_top_k: 12
+  final_top_k: 6
+  rrf_k: 60
+  hierarchy_boost: 0.12
+  graph_boost: 0.08
+  use_graph_expansion: true
+  use_document_shortlist: true
+  document_dense_top_k: 48
+  document_bm25_top_k: 48
+  document_shortlist_k: 96
+  max_candidate_chunks: 8000
+  document_score_boost: 0.2
+  local_without_region_penalty: 0.58
+  explicit_region_boost: 0.22
+  ancestor_region_boost: 0.14
+  descendant_region_boost: 0.08
+  unrelated_local_penalty: 0.45
+  observation_max_results: 4
+  observation_max_chars: 360
+generation:
+  law_seed_count: 0
+  disc_seed_count: 1500
+  train_trajectory_count: 1600
+  eval_trajectory_count: 200
+  max_retries: 2
+training:
+  output_dir: ckpt/unified_agent_qlora
+  adapter_name: qwen3_4b_unified_law_study_lora
+  max_seq_length: 4096
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.05
+  num_train_epochs: 3
+  logging_steps: 10
+  eval_steps: 50
+  save_steps: 50
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+inference:
+  max_steps: 12
+  max_new_tokens: 1024
+  temperature: 0.2
+  top_p: 0.9
+  top_k: 20
+  presence_penalty: 1.0
+  enable_thinking: false
+  load_in_4bit: true
+  compute_dtype: bfloat16
