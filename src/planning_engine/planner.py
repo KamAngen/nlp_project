@@ -26,6 +26,37 @@ SUBJECT_MARKERS = ("民法", "刑法", "行政法", "民诉", "刑诉", "商经"
 PROFILE_UPDATE_MARKERS = ("记住", "我是", "我叫", "我在备考", "我的薄弱点", "我的强项", "目标分数")
 FOLLOWUP_ANSWER_MARKERS = ("回答", "答案是", "选", "我的选择", "我选")
 
+STOP_MARKERS = ("不想做了", "算了", "停止", "取消", "不做了", "退出", "结束", "不想继续了", "放弃", "别问了", "不用了", "就这样吧", "到此为止")
+
+LEGAL_KEYWORDS = (
+    "法", "律", "法规", "法条", "案件", "诉讼", "合同", "犯罪", "赔偿", "处罚",
+    "刑法", "民法", "行政法", "宪法", "法院", "法官", "律师", "被告", "原告",
+    "判决", "裁定", "仲裁", "调解", "侵权", "违约", "盗窃", "诈骗", "刑罚",
+    "量刑", "罪名", "起诉", "上诉", "申诉", "证据", "证人", "庭审", "辩护",
+    "法律", "司法", "立法", "执法", "违法", "合法", "合规", "责任", "义务",
+    "权利", "义务", "纠纷", "调解", "仲裁", "公证", "遗嘱", "继承", "婚姻",
+    "离婚", "抚养", "赡养", "物权", "债权", "债务", "担保", "抵押", "质押",
+    "租赁", "买卖", "赠与", "继承", "遗赠", "遗嘱", "遗产", "分割", "共有",
+    "抵押权", "质权", "留置权", "定金", "违约金", "损害赔偿", "精神损害",
+    "工伤", "职业病", "劳动争议", "劳动合同", "工资", "加班", "社保", "公积金",
+    "商标", "专利", "著作权", "知识产权", "不正当竞争", "垄断", "反垄断",
+    "公司法", "破产", "清算", "股东", "董事", "监事", "经理", "法定代表人",
+    "税务", "税收", "纳税", "偷税", "漏税", "逃税", "罚款", "滞纳金",
+    "交通", "违章", "事故", "责任认定", "保险", "理赔", "交强险", "商业险",
+    "行政", "复议", "听证", "许可", "审批", "登记", "备案", "年检",
+    "考试", "法考", "司法考试", "律师考试", "题库", "真题", "模拟",
+    "学习", "复习", "备考", "考点", "知识点", "重点", "难点", "薄弱点",
+)
+
+GENERAL_QA_INDICATORS = (
+    "天气", "几点了", "现在时间", "今天星期", "几月几号",
+    "新闻", "股票", "基金", "体育", "娱乐", "电影", "电视剧",
+    "音乐", "游戏", "美食", "菜谱", "旅游", "景点",
+    "聊天", "闲聊", "讲个笑话", "讲故事", "唱歌",
+    "你好", "早上好", "晚上好", "再见", "拜拜",
+    "谢谢", "感谢", "辛苦了", "你好厉害",
+)
+
 EXAM_TYPE_PATTERNS = {
     "薄弱点强化": ("薄弱", "错题", "弱点", "容易错"),
     "章节练习": ("章节", "第.*章", "专项"),
@@ -180,6 +211,26 @@ class StudyPlanner:
                 metadata={"confidence": confidence},
             )
 
+        if intent == "stop":
+            return ActionPlan(
+                intent=intent,
+                objective="停止当前任务，返回空闲状态。",
+                steps=[],
+                response_style="acknowledge",
+                notes=["用户主动停止当前任务"],
+                metadata={"confidence": confidence},
+            )
+
+        if intent == "general_qa":
+            return ActionPlan(
+                intent=intent,
+                objective="回答非法律类的通用问题，由 LLM 直接回复。",
+                steps=[],
+                response_style="direct_answer",
+                notes=["通用问题，不调用任何工具，直接由 LLM 回答"],
+                metadata={"confidence": confidence},
+            )
+
         # 默认：legal_qa
         return ActionPlan(
             intent="legal_qa",
@@ -198,6 +249,9 @@ class StudyPlanner:
         normalized = "".join(str(query or "").split())
         if not normalized:
             return "legal_qa", 0.0
+
+        if self._looks_like_stop_intent(query):
+            return "stop", 0.95
 
         scores: dict[str, float] = {}
 
@@ -225,7 +279,11 @@ class StudyPlanner:
             scores["followup_answer"] = 0.7
 
         if not scores:
-            return "legal_qa", 0.5
+            if self._looks_like_legal_question(query):
+                return "legal_qa", 0.6
+            if self._looks_like_general_qa(query):
+                return "general_qa", 0.85
+            return "general_qa", 0.4
 
         best_intent = max(scores, key=scores.get)
         confidence = scores[best_intent]
@@ -353,6 +411,27 @@ class StudyPlanner:
         intent, confidence = self._detect_intent_with_confidence(query, context)
         input_role = self._classify_input_role(query, context, history)
         missing_info = self._identify_missing_info(query, context, intent)
+        clarification_question = self._generate_clarification_question(missing_info, intent, query)
+
+        is_domain_switch = False
+        domain_switch_from = None
+        domain_switch_to = None
+        if intent == "general_qa" and history:
+            is_domain_switch = True
+            domain_switch_from = "legal"
+            domain_switch_to = "general"
+        elif intent == "legal_qa" and history:
+            last_intent = ""
+            for h in reversed(history):
+                if h[0] == "user":
+                    last_query = h[1]
+                    if self._looks_like_general_qa(last_query):
+                        last_intent = "general_qa"
+                        break
+            if last_intent == "general_qa":
+                is_domain_switch = True
+                domain_switch_from = "general"
+                domain_switch_to = "legal"
 
         analysis = {
             "current_input_role": input_role,
@@ -367,15 +446,23 @@ class StudyPlanner:
             "intent_confidence": confidence,
             "should_ask_user": self._should_ask_user(query, context, intent, missing_info),
             "clarification_priority": self._get_clarification_priority(missing_info),
+            "clarification_question": clarification_question,
+            "should_stop_current_task": intent == "stop",
+            "stop_reason": "user_requested" if intent == "stop" else None,
+            "is_domain_switch": is_domain_switch,
+            "domain_switch_from": domain_switch_from,
+            "domain_switch_to": domain_switch_to,
         }
 
         if self.enable_logging:
             logger.info(
-                "Turn analysis: input_role='%s', intent='%s', should_ask_user=%s, missing_info=%s",
+                "Turn analysis: input_role='%s', intent='%s', should_ask_user=%s, missing_info=%s, should_stop=%s, is_domain_switch=%s",
                 input_role,
                 intent,
                 analysis["should_ask_user"],
                 missing_info[:2] if missing_info else [],
+                analysis["should_stop_current_task"],
+                analysis["is_domain_switch"],
             )
 
         return analysis
@@ -394,6 +481,12 @@ class StudyPlanner:
             "intent_confidence": 0.0,
             "should_ask_user": False,
             "clarification_priority": "none",
+            "clarification_question": None,
+            "should_stop_current_task": False,
+            "stop_reason": None,
+            "is_domain_switch": False,
+            "domain_switch_from": None,
+            "domain_switch_to": None,
         }
 
     def _classify_input_role(
@@ -580,3 +673,82 @@ class StudyPlanner:
             return "medium"
 
         return "low"
+
+    def _generate_clarification_question(
+        self,
+        missing_info: list[str],
+        intent: str,
+        original_query: str | None = None,
+    ) -> str | None:
+        if not missing_info:
+            return None
+
+        question_templates = {
+            "未提供具体数值": "请提供具体的数值，例如：10000 * 0.03 或 5000 + 2000",
+            "未明确指定测试主题": "你想练习哪个科目？例如：民法、刑法、行政法",
+            "输入可能不是明确的问句": "请补充你想了解的具体问题，例如：'什么是合同违约？'或'盗窃罪如何量刑？'",
+            "可能需要更具体的地理位置信息": "请补充你所在的省、市、区县，例如：北京市朝阳区",
+            "未提供计算表达式": "请提供需要计算的表达式，例如：10000 * 0.03 或 5000 + 2000",
+        }
+
+        for info in missing_info:
+            for keyword, template in question_templates.items():
+                if keyword in info:
+                    if original_query:
+                        return f"{template}\n（原问题：{self._compact_text(original_query, max_chars=40)}）"
+                    return template
+
+        return None
+
+    def _looks_like_stop_intent(self, query: str) -> bool:
+        normalized = "".join(str(query or "").split())
+        if any(marker in normalized for marker in STOP_MARKERS):
+            return True
+        if normalized in {"停", "停一下", "等等", "暂停", "休息", "不问了", "不学了"}:
+            return True
+        return False
+
+    def _looks_like_legal_question(self, query: str) -> bool:
+        normalized = str(query or "").strip()
+        if not normalized:
+            return False
+
+        legal_count = sum(1 for kw in LEGAL_KEYWORDS if kw in normalized)
+        if legal_count >= 1:
+            return True
+
+        legal_patterns = [
+            r".*怎么.*判.*",
+            r".*什么.*罪.*",
+            r".*多少.*年.*",
+            r".*如何.*起诉.*",
+            r".*怎么.*维权.*",
+            r".*法律.*规定.*",
+            r".*法条.*怎么.*说.*",
+        ]
+        for pattern in legal_patterns:
+            if re.search(pattern, normalized):
+                return True
+
+        return False
+
+    def _looks_like_general_qa(self, query: str) -> bool:
+        normalized = str(query or "").strip()
+        if any(indicator in normalized for indicator in GENERAL_QA_INDICATORS):
+            return True
+
+        general_patterns = [
+            r"今天.*天气",
+            r"现在.*几点",
+            r"现在.*时间",
+            r"明天.*星期",
+            r"几月.*几号",
+            r"讲个.*笑话",
+            r"唱.*歌",
+            r"讲.*故事",
+        ]
+        for pattern in general_patterns:
+            if re.search(pattern, normalized):
+                return True
+
+        return False

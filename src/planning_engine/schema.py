@@ -30,6 +30,8 @@ class ActionPlan:
     user_input_prompt: str | None = None
     max_steps: int = 10
     confidence: float = 1.0
+    original_query: str | None = None
+    turn_state: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
