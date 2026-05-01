@@ -21,7 +21,7 @@ CHINESE_NUMBER_RE = re.compile(r"[一二三四五六七八九十两]")
 CALC_MARKERS = ("计算", "算", "赔偿", "补偿", "罚款", "税额", "利息", "金额", "数额")
 PROFILE_VIEW_MARKERS = ("我的档案", "我的画像", "我的信息", "查看档案", "查看画像", "学习情况", "学习状态", "我的学习")
 REPORT_MARKERS = ("报告", "总结", "学习画像", "学习总结", "学习报告", "周报", "复盘")
-EXAM_MARKERS = ("法考测试", "模拟测试", "出题", "练习题", "刷题", "来一套", "模拟卷", "测试题", "做套题", "考考我", "测验", "练习练习", "给我几道题")
+EXAM_MARKERS = ("法考测试", "模拟测试", "出题", "练习题", "刷题", "来一套", "模拟卷", "测试题", "做套题", "考考我", "测验", "练习练习", "给我几道题", "复习", "薄弱点", "错题")
 SUBJECT_MARKERS = ("民法", "刑法", "行政法", "民诉", "刑诉", "商经", "理论法", "宪法", "国际法", "环境法", "经济法", "知识产权法")
 PROFILE_UPDATE_MARKERS = ("记住", "我是", "我叫", "我在备考", "我的薄弱点", "我的强项", "目标分数")
 FOLLOWUP_ANSWER_MARKERS = ("回答", "答案是", "选", "我的选择", "我选")
@@ -46,6 +46,7 @@ LEGAL_KEYWORDS = (
     "行政", "复议", "听证", "许可", "审批", "登记", "备案", "年检",
     "考试", "法考", "司法考试", "律师考试", "题库", "真题", "模拟",
     "学习", "复习", "备考", "考点", "知识点", "重点", "难点", "薄弱点",
+    "正当防卫", "防卫", "量刑标准", "量刑", "罪名", "定罪",
 )
 
 GENERAL_QA_INDICATORS = (
@@ -267,10 +268,11 @@ class StudyPlanner:
             scores["report_generation"] = 0.85
 
         if any(marker in normalized for marker in EXAM_MARKERS):
-            scores["mock_exam_generate"] = 0.9
+            if not any(marker in normalized for marker in PROFILE_UPDATE_MARKERS):
+                scores["mock_exam_generate"] = 0.9
 
         if any(marker in normalized for marker in PROFILE_UPDATE_MARKERS):
-            scores["profile_update"] = 0.9
+            scores["profile_update"] = 0.95
 
         if self._looks_like_calculation(normalized):
             scores["legal_calculation"] = 0.8
