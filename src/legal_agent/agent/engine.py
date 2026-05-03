@@ -97,7 +97,7 @@ class LegalAgentEngine:
         self.max_followup_questions = 2
         self.max_new_tokens = max_new_tokens
         self.step_max_new_tokens = min(max_new_tokens, 320)
-        self.final_max_new_tokens = min(max_new_tokens, 448)
+        self.final_max_new_tokens = min(max_new_tokens, 768)
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k

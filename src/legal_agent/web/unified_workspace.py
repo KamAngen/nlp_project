@@ -21,6 +21,7 @@ from legal_agent.web.model_registry import build_choice_map
 DEFAULT_PROMPT_MODE = "pure"
 DEFAULT_LIVE_STATUS = "等待输入。"
 EXAM_TYPE_CHOICES = ["综合练习", "章节练习", "薄弱点强化", "真题模拟"]
+QUESTION_TYPE_CHOICES = ["混合题型", "单选题", "简答题", "案例分析题"]
 EXAM_TOPIC_CHOICES = ["综合", "民法", "刑法", "行政法", "商经", "民诉", "刑诉", "理论法"]
 REPORT_TYPE_LABELS = {
     "学习进度报告": "study_progress",
@@ -141,6 +142,17 @@ def _resolve_runtime_devices(runtime_device: str, default_retrieval_device: str)
 
 def _resolve_report_type(report_label: str) -> str:
     return REPORT_TYPE_LABELS.get(report_label, "study_progress")
+
+
+def _resolve_question_types(question_type_label: str | None) -> list[str]:
+    mapping = {
+        "混合题型": ["single_choice", "short_answer", "case_analysis"],
+        "单选题": ["single_choice"],
+        "简答题": ["short_answer"],
+        "案例分析题": ["case_analysis"],
+    }
+    label = str(question_type_label or "").strip()
+    return list(mapping.get(label, mapping["混合题型"]))
 
 
 def _ensure_selection(agent: LegalStudyAgent, state: dict[str, Any] | None) -> tuple[str, str, dict[str, Any]]:
@@ -347,7 +359,7 @@ def _submit_chat(
     yield _workspace_outputs_with_input(interim_payload, live_status=state["live_status"], question_value=question)
 
     try:
-        response = agent.handle_message(
+        for update in agent.stream_message(
             effective_question,
             user_id=user_id,
             session_id=session_id,
@@ -358,38 +370,56 @@ def _submit_chat(
             model_device=model_device,
             allow_button_only_intents=False,
             display_question=question,
-        )
-        state["trace"] = response.trace
-        state["report_markdown"] = response.report_markdown or state.get("report_markdown") or ""
-        state["report_path"] = response.report_path or state.get("report_path")
-        state["last_assistant_message"] = response.answer
-        state["live_status"] = "已完成分析。"
-        final_chat = list(live_chat)
-        final_chat[-1] = {"role": "assistant", "content": response.answer}
-        if response.needs_user_input and response.clarification_question:
-            state["pending_question"] = response.clarification_question
-            state["clarification_answers"] = clarification_answers
-            state["pending_root_question"] = str(state.get("pending_root_question") or question)
-        else:
-            state["pending_question"] = None
-            state["clarification_answers"] = []
-            state["pending_root_question"] = None
+        ):
+            event = str(update.get("event") or "status")
+            if event == "final":
+                response = update.get("response")
+                if response is None:
+                    raise RuntimeError("统一 Agent 流式执行未返回最终响应。")
+                final_answer = str(getattr(response, "answer", "") or update.get("message") or "已完成本轮处理。")
+                state["trace"] = str(getattr(response, "trace", "") or update.get("trace") or state.get("trace") or "")
+                state["report_markdown"] = getattr(response, "report_markdown", None) or state.get("report_markdown") or ""
+                state["report_path"] = getattr(response, "report_path", None) or state.get("report_path")
+                state["last_assistant_message"] = final_answer
+                state["live_status"] = "已完成分析。"
+                final_chat = list(live_chat)
+                final_chat[-1] = {"role": "assistant", "content": final_answer}
+                if getattr(response, "needs_user_input", False) and getattr(response, "clarification_question", None):
+                    state["pending_question"] = response.clarification_question
+                    state["clarification_answers"] = clarification_answers
+                    state["pending_root_question"] = str(state.get("pending_root_question") or question)
+                else:
+                    state["pending_question"] = None
+                    state["clarification_answers"] = []
+                    state["pending_root_question"] = None
 
-        final_payload = dict(base_payload)
-        final_payload["chat_messages"] = final_chat
-        final_payload["trace"] = state["trace"]
-        final_payload["state"] = state
-        final_payload["report_display_markdown"] = _render_report_panel(str(state.get("report_markdown") or ""))
-        final_payload["report_path"] = state.get("report_path")
-        final_payload["user_choices"] = list(base_payload["user_choices"])
-        final_payload["user_value"] = user_id
-        final_payload["session_choices"] = list(base_payload["session_choices"])
-        final_payload["session_value"] = session_id
-        final_payload["reply_copy_text"] = response.answer
-        final_payload["report_copy_text"] = str(state.get("report_markdown") or "")
-        final_payload["live_status"] = state["live_status"]
-        yield _workspace_outputs_with_input(final_payload, live_status=state["live_status"], question_value="")
-        return
+                final_payload = dict(base_payload)
+                final_payload["chat_messages"] = final_chat
+                final_payload["trace"] = state["trace"]
+                final_payload["state"] = state
+                final_payload["report_display_markdown"] = _render_report_panel(str(state.get("report_markdown") or ""))
+                final_payload["report_path"] = state.get("report_path")
+                final_payload["user_choices"] = list(base_payload["user_choices"])
+                final_payload["user_value"] = user_id
+                final_payload["session_choices"] = list(base_payload["session_choices"])
+                final_payload["session_value"] = session_id
+                final_payload["reply_copy_text"] = final_answer
+                final_payload["report_copy_text"] = str(state.get("report_markdown") or "")
+                final_payload["live_status"] = state["live_status"]
+                yield _workspace_outputs_with_input(final_payload, live_status=state["live_status"], question_value="")
+                return
+
+            state["trace"] = str(update.get("trace") or state.get("trace") or "")
+            state["live_status"] = str(update.get("message") or "正在处理中。")
+            live_payload = dict(base_payload)
+            live_payload["chat_messages"] = list(live_chat[:-1]) + [{"role": "assistant", "content": state["live_status"]}]
+            live_payload["trace"] = state["trace"]
+            live_payload["state"] = state
+            live_payload["reply_copy_text"] = state["live_status"]
+            live_payload["live_status"] = state["live_status"]
+            yield _workspace_outputs_with_input(live_payload, live_status=state["live_status"], question_value=question)
+
+        raise RuntimeError("统一 Agent 流式执行未返回最终结果。")
     except Exception as exc:
         error_message = f"处理失败：{exc}"
         live_chat[-1] = {"role": "assistant", "content": error_message}
@@ -415,6 +445,7 @@ def _run_exam_action(
     study_config_path: str,
     runtime_device: str,
     default_retrieval_device: str,
+    question_type_label: str = "混合题型",
 ):
     state = dict(state or _new_ui_state())
     model_path, adapter_path = _resolve_model_choice(config_path, model_label)
@@ -428,6 +459,7 @@ def _run_exam_action(
         topic=effective_topic,
         question_count=question_count,
         exam_type=exam_type,
+        question_types=_resolve_question_types(question_type_label),
         model_path=model_path,
         adapter_path=adapter_path,
         prompt_mode=DEFAULT_PROMPT_MODE,
@@ -438,7 +470,7 @@ def _run_exam_action(
     state["pending_root_question"] = None
     state["pending_question"] = None
     state["clarification_answers"] = []
-    state["live_status"] = f"已生成{exam_type}：{effective_topic}。"
+    state["live_status"] = f"已生成{exam_type}：{effective_topic}，题型为{question_type_label}。"
     refreshed = _refresh_workspace_data(
         state,
         config_path=config_path,
@@ -750,10 +782,19 @@ def build_unified_workspace(
                 exam_type = gr.Dropdown(
                     choices=EXAM_TYPE_CHOICES,
                     value=EXAM_TYPE_CHOICES[0],
-                    label="测试类型",
+                    label="练习模式",
                     interactive=True,
                     filterable=False,
                     elem_id="exam-type-select",
+                    elem_classes=SELECT_CLASSES,
+                )
+                exam_question_type = gr.Dropdown(
+                    choices=QUESTION_TYPE_CHOICES,
+                    value=QUESTION_TYPE_CHOICES[0],
+                    label="题型方案",
+                    interactive=True,
+                    filterable=False,
+                    elem_id="exam-question-type-select",
                     elem_classes=SELECT_CLASSES,
                 )
                 exam_topic = gr.Dropdown(
@@ -872,7 +913,7 @@ def build_unified_workspace(
     )
     exam_button.click(
         fn=_run_exam_action,
-        inputs=[exam_type, exam_topic, exam_count, workspace_state, model_dropdown, config_state, study_config_state, runtime_device_dropdown, default_retrieval_state],
+        inputs=[exam_type, exam_topic, exam_count, workspace_state, model_dropdown, config_state, study_config_state, runtime_device_dropdown, default_retrieval_state, exam_question_type],
         outputs=[chatbot, trace_box, workspace_state, report_markdown, report_file, user_dropdown, session_dropdown],
     )
     report_button.click(

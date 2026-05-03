@@ -152,6 +152,66 @@ EVALUATION_MODE_BY_QUESTION_TYPE = {
     "short_answer": "llm_subjective",
     "case_analysis": "llm_subjective",
 }
+CASE_ANALYSIS_TASK_FAMILIES = {
+    "jud_read_compre",
+    "judgement_predit",
+    "sim_case_match",
+    "leg_case_cls",
+    "jud_doc_sum",
+}
+CASE_ANALYSIS_ACTION_HINTS = (
+    "请阅读以下案情",
+    "请根据以下案情",
+    "请结合以下案情",
+    "请结合案情",
+    "请分析",
+    "请说明理由",
+    "结合法律规定",
+    "推理出以下案件中的判决",
+    "推断案件判决",
+    "判决结果",
+    "裁判结果",
+    "如何处理",
+    "如何认定",
+    "如何定性",
+    "是否构成",
+    "是否违法",
+    "应承担",
+    "争议焦点",
+    "法律后果",
+    "应如何",
+    "何罪",
+)
+CASE_ANALYSIS_FACT_HINTS = (
+    "案情",
+    "本案",
+    "被告人",
+    "原告",
+    "被告",
+    "上诉人",
+    "被上诉人",
+    "申请人",
+    "被申请人",
+    "人民检察院指控",
+    "法院经审理查明",
+    "甲公司",
+    "乙公司",
+    "某公司",
+    "某企业",
+    "某厂",
+    "某村",
+    "某县",
+    "某市",
+)
+CASE_ANALYSIS_FACT_RE = re.compile(r"(?:19|20)\d{2}年|甲[乙丙丁]|乙[方人]|丙[方人]|丁[方人]")
+CASE_ANALYSIS_LEADING_ENUM_RE = re.compile(r"^(?:第?[一二三四五六七八九十百]+[、.．)]|\d+[、.．)])\s*")
+CASE_ANALYSIS_PROMPT_BY_TASK_FAMILY = {
+    "judgement_predit": "请阅读以下案情，推断案件判决结果并说明理由：",
+    "jud_doc_sum": "请阅读以下案情，概括案件要点并结合法律规定作答：",
+    "leg_case_cls": "请阅读以下案情，判断其所属法律问题并说明理由：",
+    "sim_case_match": "请阅读以下案情，分析其法律争点并作答：",
+    "jud_read_compre": "请阅读以下案情，结合法律规定进行案例分析并作答：",
+}
 GENERIC_DISTRACTORS = {
     "民法": [
         "通常只能请求行政机关先作出处罚，不能直接主张民事救济。",
@@ -630,7 +690,10 @@ def _candidate_from_disc_record(row: dict[str, Any]) -> StudyCandidate | None:
         source_options = parsed_choice.options
         source_answer_label = parsed_choice.answer_label
     else:
-        question = _compact_freeform_question(question)
+        if question_type == "case_analysis":
+            question = _normalize_case_analysis_question(question, task_family=task_family)
+        else:
+            question = _compact_freeform_question(question)
         if not question:
             return None
         answer_summary = _answer_summary(answer)
@@ -693,6 +756,57 @@ def _sanitize_question_text(text: str) -> str:
     return clean_text(cleaned).strip(" ：:；;。")
 
 
+def _looks_like_case_fact_text(text: str) -> bool:
+    cleaned = clean_text(text)
+    if not cleaned:
+        return False
+    if any(hint in cleaned for hint in CASE_ANALYSIS_FACT_HINTS):
+        return True
+    return bool(CASE_ANALYSIS_FACT_RE.search(cleaned))
+
+
+def _has_case_analysis_action(text: str) -> bool:
+    cleaned = clean_text(text)
+    if not cleaned:
+        return False
+    return any(hint in cleaned for hint in CASE_ANALYSIS_ACTION_HINTS)
+
+
+def _looks_like_case_analysis_question(question: str, answer: str, *, task_family: str) -> bool:
+    cleaned_question = _sanitize_question_text(question)
+    cleaned_answer = clean_text(answer)
+    if not cleaned_question:
+        return False
+    if task_family in CASE_ANALYSIS_TASK_FAMILIES:
+        return True
+    if not _looks_like_case_fact_text(cleaned_question):
+        return False
+    return _has_case_analysis_action(cleaned_question) or len(cleaned_question) >= 60 or len(cleaned_answer) >= 180
+
+
+def _normalize_case_analysis_question(text: str, *, task_family: str, max_chars: int = 760) -> str:
+    cleaned = _sanitize_question_text(text)
+    if not cleaned:
+        return ""
+    if _has_case_analysis_action(cleaned):
+        if len(cleaned) <= max_chars:
+            return cleaned
+        summarized = _summarize_complete_text(cleaned, max_chars=max_chars, max_sentences=5, allow_clause_split=False)
+        return summarized or cleaned[:max_chars].rstrip(" ，,；;：:")
+    if not _looks_like_case_fact_text(cleaned):
+        return ""
+    prompt = CASE_ANALYSIS_PROMPT_BY_TASK_FAMILY.get(task_family, "请阅读以下案情，结合法律规定进行案例分析并作答：")
+    facts = clean_text(CASE_ANALYSIS_LEADING_ENUM_RE.sub("", cleaned))
+    combined = f"{prompt}\n{facts}"
+    if len(combined) <= max_chars:
+        return combined
+    budget = max(240, max_chars - len(prompt) - 1)
+    summarized = _summarize_complete_text(facts, max_chars=budget, max_sentences=5, allow_clause_split=False)
+    if summarized:
+        return f"{prompt}\n{summarized}"
+    return f"{prompt}\n{facts[:budget].rstrip(' ，,；;：:')}"
+
+
 def _compact_freeform_question(text: str, *, max_chars: int = 220) -> str:
     cleaned = _sanitize_question_text(text)
     if not cleaned:
@@ -748,11 +862,12 @@ def _infer_question_type(
 ) -> str:
     if parsed_choice is not None:
         return "single_choice"
-    if task_family in {"jud_read_compre", "judgement_predit", "sim_case_match", "leg_case_cls", "jud_doc_sum"}:
+    if _looks_like_case_analysis_question(question, answer, task_family=task_family):
         return "case_analysis"
-    if len(question) >= 120 or len(answer) >= 360:
-        return "case_analysis"
-    return QUESTION_TYPE_BY_TASK_FAMILY.get(task_family, "short_answer")
+    question_type = QUESTION_TYPE_BY_TASK_FAMILY.get(task_family, "short_answer")
+    if question_type == "single_choice":
+        return "short_answer"
+    return question_type
 
 
 def _extract_choice_options(question: str) -> tuple[str, dict[str, str]] | None:

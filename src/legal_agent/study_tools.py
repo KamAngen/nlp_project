@@ -15,9 +15,11 @@ from legal_agent.utils.text import truncate_text
 from rag_engine.service import KnowledgeService
 
 
-INLINE_CHOICE_ANSWER_RE = re.compile(r"(?P<index>\d+)\s*[\.、:：-]?\s*(?P<answer>[A-Da-d])(?=(?:\s|$))")
+INLINE_CHOICE_ANSWER_RE = re.compile(
+    r"(?:第\s*)?(?P<index>\d+)\s*(?:题)?\s*[\.、:：\-）)]?\s*(?P<answer>[A-Da-d])(?=(?:\s|$))"
+)
 NUMBERED_ANSWER_BLOCK_RE = re.compile(
-    r"(?ms)^\s*(?P<index>\d+)\s*[\.、:：-]\s*(?P<answer>.*?)(?=^\s*\d+\s*[\.、:：-]|\Z)"
+    r"(?ms)(?:(?<=^)|(?<=[\n\r\t ]))(?:第\s*)?(?P<index>\d+)\s*(?:题)?\s*[\.、:：\-）)]\s*(?P<answer>.*?)(?=(?:(?<=^)|(?<=[\n\r\t ]))(?:第\s*)?\d+\s*(?:题)?\s*[\.、:：\-）)]|\Z)"
 )
 
 
@@ -303,6 +305,13 @@ class StudyToolExecutor:
             raise ValueError("当前没有待评分的模拟测试。")
 
         answers = self._parse_answer_sheet(answers_text)
+        exam_questions = [dict(item) for item in exam_payload.get("questions", []) if isinstance(item, dict)]
+        if not answers and len(exam_questions) == 1:
+            first_question = exam_questions[0]
+            if str(first_question.get("question_type") or "single_choice") != "single_choice":
+                raw_answer = str(answers_text or "").strip()
+                if raw_answer:
+                    answers = {str(int(first_question.get("index") or 1)): raw_answer}
         profile = self.memory_manager.get_user_profile(user_id)
         wrong_question_bank = {
             str(record_id): dict(item)
@@ -316,7 +325,11 @@ class StudyToolExecutor:
         wrong_questions = []
         corrected_question_ids: list[str] = []
         details = []
-        for question in exam_payload.get("questions", []):
+        review_questions = []
+        mastered_count = 0
+        review_count = 0
+        incorrect_count = 0
+        for question in exam_questions:
             index = int(question["index"])
             score = int(question.get("score", 20))
             total_score += score
@@ -324,6 +337,8 @@ class StudyToolExecutor:
             question_type = str(question.get("question_type") or "single_choice")
             record_id = str(question.get("record_id") or "").strip()
             question_tags = [str(tag) for tag in question.get("tags", []) if str(tag).strip()]
+            classification = "incorrect"
+            normalized_user_answer = ""
             if question_type == "single_choice":
                 correct_answer = str(question.get("answer") or "").upper()
                 normalized_user_answer = self._normalize_choice_answer(user_answer, dict(question.get("options") or {}))
@@ -332,21 +347,61 @@ class StudyToolExecutor:
                 grading_feedback = ""
                 matched_points: list[str] = []
                 missing_points: list[str] = []
+                if is_correct:
+                    classification = "mastered"
+                elif not normalized_user_answer:
+                    classification = "unanswered"
             else:
                 grade = self._grade_subjective_answer(question, user_answer=user_answer or "")
                 correct_answer = str(question.get("reference_answer") or question.get("answer") or "").strip()
                 earned = max(0, min(score, int(round(float(grade.get("score") or 0)))))
-                is_correct = earned >= max(int(round(score * 0.75)), score - 2)
                 grading_feedback = str(grade.get("feedback") or "").strip()
                 matched_points = [str(item) for item in grade.get("matched_points", []) if str(item).strip()][:5]
                 missing_points = [str(item) for item in grade.get("missing_points", []) if str(item).strip()][:5]
+                classification = self._classify_subjective_answer(
+                    question,
+                    earned_score=earned,
+                    max_score=score,
+                    user_answer=user_answer or "",
+                    grader_payload=grade,
+                )
+                is_correct = classification in {"mastered", "review"}
 
             earned_score += earned
-            if is_correct:
+            if classification == "mastered":
+                mastered_count += 1
                 strong_tags.extend(question_tags)
                 if record_id and record_id in wrong_question_bank:
                     corrected_question_ids.append(record_id)
+            elif classification == "review":
+                review_count += 1
+                weak_tags.extend(question_tags)
+                review_questions.append(
+                    {
+                        "index": index,
+                        "record_id": record_id,
+                        "topic": str(question.get("topic") or exam_payload.get("topic") or "综合"),
+                        "question_type": question_type,
+                        "question": str(question.get("question") or ""),
+                        "options": dict(question.get("options") or {}),
+                        "tags": question_tags,
+                        "analysis": str(question.get("analysis") or ""),
+                        "correct_answer": correct_answer,
+                        "user_answer": user_answer,
+                        "display_user_answer": normalized_user_answer or user_answer,
+                        "earned_score": earned,
+                        "max_score": score,
+                        "grading_feedback": grading_feedback,
+                        "matched_points": matched_points,
+                        "missing_points": missing_points,
+                        "exam_session_id": str(exam_payload.get("exam_session_id") or ""),
+                        "classification": classification,
+                    }
+                )
+                if record_id and record_id in wrong_question_bank:
+                    corrected_question_ids.append(record_id)
             else:
+                incorrect_count += 1
                 weak_tags.extend(question_tags)
                 wrong_questions.append(
                     {
@@ -360,12 +415,14 @@ class StudyToolExecutor:
                         "analysis": str(question.get("analysis") or ""),
                         "correct_answer": correct_answer,
                         "user_answer": user_answer,
+                        "display_user_answer": normalized_user_answer or user_answer,
                         "earned_score": earned,
                         "max_score": score,
                         "grading_feedback": grading_feedback,
                         "matched_points": matched_points,
                         "missing_points": missing_points,
                         "exam_session_id": str(exam_payload.get("exam_session_id") or ""),
+                        "classification": classification,
                     }
                 )
             details.append(
@@ -373,15 +430,18 @@ class StudyToolExecutor:
                     "index": index,
                     "question_type": question_type,
                     "user_answer": user_answer,
+                    "display_user_answer": normalized_user_answer or user_answer,
                     "correct_answer": correct_answer,
                     "is_correct": is_correct,
                     "score": earned,
                     "max_score": score,
                     "analysis": question.get("analysis"),
                     "question": question.get("question"),
+                    "options": dict(question.get("options") or {}),
                     "grading_feedback": grading_feedback,
                     "matched_points": matched_points,
                     "missing_points": missing_points,
+                    "classification": classification,
                 }
             )
 
@@ -393,6 +453,10 @@ class StudyToolExecutor:
             "earned_score": earned_score,
             "total_score": total_score,
             "details": details,
+            "review_questions": review_questions,
+            "mastered_count": mastered_count,
+            "review_count": review_count,
+            "incorrect_count": incorrect_count,
             "weak_tags": list(dict.fromkeys(weak_tags))[:8],
             "strong_tags": [
                 tag for tag in list(dict.fromkeys(strong_tags))[:8] if tag not in set(dict.fromkeys(weak_tags))
@@ -459,6 +523,8 @@ class StudyToolExecutor:
         return upper[:1]
 
     def _grade_subjective_answer(self, question: dict[str, object], *, user_answer: str) -> dict[str, object]:
+        if not str(user_answer or "").strip():
+            return self._fallback_subjective_grade(question, user_answer="")
         if self.subjective_exam_grader is not None:
             try:
                 graded = dict(self.subjective_exam_grader(question, user_answer) or {})
@@ -466,13 +532,41 @@ class StudyToolExecutor:
                 graded.setdefault("feedback", "")
                 graded.setdefault("matched_points", [])
                 graded.setdefault("missing_points", [])
+                graded.setdefault("quality_level", "")
                 return graded
             except Exception:
                 pass
         return self._fallback_subjective_grade(question, user_answer=user_answer)
 
+    def _classify_subjective_answer(
+        self,
+        question: dict[str, object],
+        *,
+        earned_score: int,
+        max_score: int,
+        user_answer: str,
+        grader_payload: dict[str, object],
+    ) -> str:
+        if not str(user_answer or "").strip():
+            return "unanswered"
+
+        quality_level = str(grader_payload.get("quality_level") or "").strip().lower()
+        if quality_level in {"mastered", "review", "incorrect"}:
+            return quality_level
+
+        ratio = earned_score / max(max_score, 1)
+        question_type = str(question.get("question_type") or "short_answer")
+        mastered_threshold = 0.82 if question_type == "case_analysis" else 0.78
+        review_threshold = 0.45 if question_type == "case_analysis" else 0.5
+        if ratio >= mastered_threshold:
+            return "mastered"
+        if ratio >= review_threshold:
+            return "review"
+        return "incorrect"
+
     def _fallback_subjective_grade(self, question: dict[str, object], *, user_answer: str) -> dict[str, object]:
         reference_answer = str(question.get("reference_answer") or question.get("answer") or question.get("analysis") or "").strip()
+        analysis = str(question.get("analysis") or "").strip()
         max_score = int(question.get("score", 20))
         if not user_answer.strip():
             return {
@@ -480,24 +574,38 @@ class StudyToolExecutor:
                 "feedback": "未检测到作答内容。",
                 "matched_points": [],
                 "missing_points": [truncate_text(reference_answer, 120)] if reference_answer else [],
+                "quality_level": "incorrect",
             }
-        exact = exact_match_score(user_answer, reference_answer)
-        overlap = token_f1(user_answer, reference_answer)
-        score_ratio = max(exact, overlap)
+        comparison_reference = "\n".join(part for part in [reference_answer, analysis] if part)
+        exact = exact_match_score(user_answer, comparison_reference)
+        overlap = token_f1(user_answer, comparison_reference)
+        key_points = [
+            clause.strip("；;。,.：:")
+            for clause in re.split(r"[；;。\n]", comparison_reference)
+            if clause.strip("；;。,.：:")
+        ]
+        key_points = [point for point in key_points if len(point) >= 6][:5]
+        point_hits = [point for point in key_points if token_f1(user_answer, point) >= 0.34 or exact_match_score(user_answer, point) >= 1.0]
+        point_ratio = len(point_hits) / max(len(key_points), 1) if key_points else 0.0
+        score_ratio = max(exact, overlap * 0.75 + point_ratio * 0.25, point_ratio)
         score = int(round(max_score * min(1.0, score_ratio)))
-        matched_points = [truncate_text(reference_answer, 120)] if score_ratio >= 0.55 and reference_answer else []
-        missing_points = [] if score_ratio >= 0.75 else ([truncate_text(reference_answer, 120)] if reference_answer else [])
-        if score_ratio >= 0.75:
+        matched_points = [truncate_text(point, 120) for point in point_hits[:3]]
+        missing_points = [truncate_text(point, 120) for point in key_points if point not in point_hits][:3]
+        if score_ratio >= 0.78:
             feedback = "核心法律结论基本到位。"
-        elif score_ratio >= 0.45:
+            quality_level = "mastered"
+        elif score_ratio >= 0.5:
             feedback = "答案抓到了部分要点，但关键法律依据或结论还不够完整。"
+            quality_level = "review"
         else:
             feedback = "答案与参考答案偏差较大，需要回到标准结论重新梳理。"
+            quality_level = "incorrect"
         return {
             "score": score,
             "feedback": feedback,
-            "matched_points": matched_points,
-            "missing_points": missing_points,
+            "matched_points": matched_points or ([truncate_text(reference_answer, 120)] if score_ratio >= 0.55 and reference_answer else []),
+            "missing_points": missing_points or ([] if score_ratio >= 0.75 else ([truncate_text(reference_answer, 120)] if reference_answer else [])),
+            "quality_level": quality_level,
         }
 
     def _render_report(self, snapshot: dict[str, object], *, report_type: str) -> str:

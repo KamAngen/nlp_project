@@ -363,6 +363,41 @@ def test_candidate_topic_inference_prefers_reference_law_over_generic_mediation_
     assert any("证券投资基金法" in reference for reference in candidate.references)
 
 
+def test_candidate_from_disc_record_keeps_general_legal_qa_as_short_answer():
+    candidate = _candidate_from_disc_record(
+        {
+            "sample_id": "admin-comp-001",
+            "task_family": "legal_question_answering",
+            "subset_name": "DISC-Law-SFT-Pair-QA-released",
+            "instruction": "什么是国家赔偿？",
+            "answer": "国家赔偿是指国家机关及其工作人员违法行使职权，给公民、法人或者其他组织造成损害时，依法承担的赔偿责任。",
+            "references": ["《国家赔偿法》"],
+        }
+    )
+
+    assert candidate is not None
+    assert candidate.question_type == "short_answer"
+    assert candidate.question == "什么是国家赔偿？"
+
+
+def test_candidate_from_disc_record_completes_fact_only_case_prompt():
+    candidate = _candidate_from_disc_record(
+        {
+            "sample_id": "case-facts-001",
+            "task_family": "jud_read_compre",
+            "subset_name": "DISC-Law-SFT-Pair",
+            "instruction": "二、2016年4月23日早上，被告人邹1某和伙同被告人邹3某和邹想新再次到果园砍伐果树，共毁坏果树100株。",
+            "answer": "被告人的行为符合故意毁坏财物罪的构成要件，应结合毁坏数量、主观故意和共同犯罪情节综合认定。",
+            "references": ["《中华人民共和国刑法》"],
+        }
+    )
+
+    assert candidate is not None
+    assert candidate.question_type == "case_analysis"
+    assert candidate.question.startswith("请阅读以下案情，结合法律规定进行案例分析并作答：")
+    assert "被告人邹1某" in candidate.question
+
+
 def test_prepare_study_knowledge_assets_skips_when_existing_counts_are_sufficient(tmp_path: Path):
     app_config = _app_config(tmp_path)
     study_config = _study_config(tmp_path)

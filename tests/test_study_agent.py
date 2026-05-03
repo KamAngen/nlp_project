@@ -303,9 +303,125 @@ def test_score_response_explains_wrong_answers(tmp_path: Path, monkeypatch):
     response = agent.handle_message("1.A", user_id="demo_user", session_id="demo_session")
 
     assert response.intent == "mock_exam_score"
-    assert "正确答案是 B" in response.answer
-    assert "解释：" in response.answer
+    assert "题干：收到信息更正请求后应如何处理？" in response.answer
+    assert "你的作答：A. 可以忽略" in response.answer
+    assert "正确答案：B. 核实身份后及时提供查询、更正或删除" in response.answer
+    assert "解析：" in response.answer
     assert "学习反馈报告已同步到右侧面板" in response.answer
+
+
+def test_render_score_answer_places_question_before_subjective_feedback(tmp_path: Path):
+    agent = LegalStudyAgent.__new__(LegalStudyAgent)
+
+    answer = agent._render_score_answer(
+        [
+            {
+                "tool_name": "score_exam",
+                "result": {
+                    "score_percent": 60.0,
+                    "earned_score": 12,
+                    "total_score": 20,
+                    "mastered_count": 0,
+                    "review_count": 1,
+                    "incorrect_count": 0,
+                    "unanswered_count": 0,
+                    "weak_tags": ["民诉", "保全"],
+                    "strong_tags": [],
+                    "wrong_questions": [],
+                    "details": [
+                        {
+                            "index": 1,
+                            "question_type": "short_answer",
+                            "question": "申请诉前财产保全时，申请人通常需要说明哪些核心条件？",
+                            "user_answer": "应当先说明情况紧急，否则损害会扩大。",
+                            "display_user_answer": "应当先说明情况紧急，否则损害会扩大。",
+                            "correct_answer": "应说明情况紧急，不立即保全将导致合法权益受到难以弥补的损害，并依法提供担保。",
+                            "classification": "review",
+                            "is_correct": True,
+                            "score": 12,
+                            "max_score": 20,
+                            "analysis": "诉前保全通常要求紧急性和担保两项核心条件。",
+                            "grading_feedback": "抓住了紧急性，但遗漏了担保要件。",
+                            "matched_points": ["说明了情况紧急"],
+                            "missing_points": ["依法提供担保"],
+                            "options": {},
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+
+    assert "第1题 [简答题] 待巩固" in answer
+    assert "你的作答：未作答" not in answer
+    assert answer.index("题干：申请诉前财产保全时，申请人通常需要说明哪些核心条件？") < answer.index("你的作答：应当先说明情况紧急，否则损害会扩大。")
+    assert "待补要点：依法提供担保" in answer
+    assert "参考要点：应说明情况紧急，不立即保全将导致合法权益受到难以弥补的损害，并依法提供担保。" in answer
+
+
+def test_render_score_answer_keeps_case_analysis_text_intact(tmp_path: Path):
+    agent = LegalStudyAgent.__new__(LegalStudyAgent)
+    prompt = (
+        "甲公司与乙公司签订建设工程合同后，乙公司未按约完成施工，随后双方又因工程款结算、停工损失、质量修复责任发生争议。"
+        "法院查明，项目经理曾口头确认追加工程量，但未及时形成书面签证，监理日志和往来邮件均反映甲公司持续要求赶工。"
+        "请结合案情说明责任应如何分配。"
+    )
+    user_answer = (
+        "我认为应先区分合同约定、实际履行和证据证明力。对于已经通过监理日志、往来邮件以及实际施工结果能够相互印证的追加工程量，"
+        "甲公司不能仅以缺少书面签证为由当然否认。停工损失部分还应继续审查停工原因是否归责于甲公司，以及乙公司是否尽到减损义务。"
+    )
+    correct_answer = (
+        "参考上，应围绕追加工程量认定、工程价款结算依据、停工损失归责、质量修复范围和减损义务展开分析，"
+        "再根据双方违约程度分配相应责任。"
+    )
+    analysis = (
+        "案例分析时不能只回答一个结论，还要把合同约定、履行证据、举证责任和损失归责串起来，形成完整的法律分析路径。"
+    )
+
+    answer = agent._render_score_answer(
+        [
+            {
+                "tool_name": "score_exam",
+                "result": {
+                    "score_percent": 70.0,
+                    "earned_score": 14,
+                    "total_score": 20,
+                    "mastered_count": 0,
+                    "review_count": 1,
+                    "incorrect_count": 0,
+                    "unanswered_count": 0,
+                    "weak_tags": ["民法", "案例分析题"],
+                    "strong_tags": [],
+                    "wrong_questions": [],
+                    "details": [
+                        {
+                            "index": 1,
+                            "question_type": "case_analysis",
+                            "question": prompt,
+                            "user_answer": user_answer,
+                            "display_user_answer": user_answer,
+                            "correct_answer": correct_answer,
+                            "classification": "review",
+                            "is_correct": True,
+                            "score": 14,
+                            "max_score": 20,
+                            "analysis": analysis,
+                            "grading_feedback": "已经抓到主要争点，但责任分配的展开还不够完整。",
+                            "matched_points": ["提到了追加工程量认定", "提到了停工损失归责"],
+                            "missing_points": ["质量修复责任展开不足"],
+                            "options": {},
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+
+    assert f"题干：{prompt}" in answer
+    assert f"你的作答：{user_answer}" in answer
+    assert f"参考要点：{correct_answer}" in answer
+    assert f"解析：{analysis}" in answer
+    assert "…" not in answer
 
 
 def test_render_exam_answer_surfaces_selection_notes_and_non_misleading_profile_copy(tmp_path: Path):

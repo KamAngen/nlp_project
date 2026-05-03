@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from hashlib import blake2b
 from pathlib import Path
 import random
+import re
 from typing import Iterable
 
-from legal_agent.utils.text import simple_tokenize, truncate_text
+from legal_agent.utils.text import clean_text, simple_tokenize, truncate_text
 from rag_engine.loaders import load_case_bank, load_common_knowledge, load_question_bank
 from rag_engine.schema import KnowledgeHit, KnowledgeRecord
 
@@ -39,6 +41,62 @@ CONTEXT_DEPENDENT_QUESTION_SNIPPETS = (
     "以上背景",
     "以上材料",
 )
+CASE_ANALYSIS_ACTION_HINTS = (
+    "请阅读以下案情",
+    "请根据以下案情",
+    "请结合以下案情",
+    "请结合案情",
+    "请分析",
+    "请说明理由",
+    "结合法律规定",
+    "推理出以下案件中的判决",
+    "推断案件判决",
+    "判决结果",
+    "裁判结果",
+    "如何处理",
+    "如何认定",
+    "如何定性",
+    "是否构成",
+    "是否违法",
+    "应承担",
+    "争议焦点",
+    "法律后果",
+    "应如何",
+    "何罪",
+)
+CASE_ANALYSIS_FACT_HINTS = (
+    "案情",
+    "本案",
+    "被告人",
+    "原告",
+    "被告",
+    "上诉人",
+    "被上诉人",
+    "申请人",
+    "被申请人",
+    "人民检察院指控",
+    "法院经审理查明",
+    "甲公司",
+    "乙公司",
+    "某公司",
+    "某企业",
+    "某厂",
+    "某村",
+    "某县",
+    "某市",
+)
+CASE_ANALYSIS_FACT_RE = re.compile(r"(?:19|20)\d{2}年|甲[乙丙丁]|乙[方人]|丙[方人]|丁[方人]")
+CASE_ANALYSIS_LEADING_ENUM_RE = re.compile(r"^(?:第?[一二三四五六七八九十百]+[、.．)]|\d+[、.．)])\s*")
+CASE_ANALYSIS_PROMPT_BY_TASK_FAMILY = {
+    "judgement_predit": "请阅读以下案情，推断案件判决结果并说明理由：",
+    "jud_doc_sum": "请阅读以下案情，概括案件要点并结合法律规定作答：",
+    "leg_case_cls": "请阅读以下案情，判断其所属法律问题并说明理由：",
+    "sim_case_match": "请阅读以下案情，分析其法律争点并作答：",
+    "jud_read_compre": "请阅读以下案情，结合法律规定进行案例分析并作答：",
+}
+FAST_ALNUM_TOKEN_RE = re.compile(r"[0-9A-Za-z_]{2,}")
+FAST_CHINESE_BLOCK_RE = re.compile(r"[\u4e00-\u9fff]+")
+COMPARISON_NORMALIZE_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
 
 
 class LegacyStatuteRetrieverAdapter:
@@ -104,9 +162,18 @@ class KnowledgeService:
         self.question_bank = load_question_bank(question_bank_path)
         self.case_bank = load_case_bank(case_bank_path)
         self.common_knowledge = load_common_knowledge(common_knowledge_path)
+        self._usable_question_bank: list[KnowledgeRecord] = []
+        self._usable_question_type_index: dict[str, list[KnowledgeRecord]] = {}
+        self._usable_question_loose_topic_index: dict[str, list[KnowledgeRecord]] = {}
+        self._usable_question_strict_topic_index: dict[str, list[KnowledgeRecord]] = {}
+        self._usable_question_loose_topic_type_index: dict[tuple[str, str], list[KnowledgeRecord]] = {}
+        self._usable_question_strict_topic_type_index: dict[tuple[str, str], list[KnowledgeRecord]] = {}
+        self._local_search_indexes: dict[str, dict[str, object]] = {}
         self.legacy_statute = None
         if use_legacy_statute_rag and legacy_config_path is not None:
             self.legacy_statute = LegacyStatuteRetrieverAdapter(legacy_config_path, device=legacy_device)
+        self._build_question_indexes()
+        self._build_local_search_indexes()
 
     def summary(self) -> dict[str, object]:
         topic_distribution: dict[str, int] = {}
@@ -129,11 +196,11 @@ class KnowledgeService:
         selected_sources = set(sources or ["statute", "question_bank", "case_bank", "common_knowledge"])
         hits: list[KnowledgeHit] = []
         if "question_bank" in selected_sources:
-            hits.extend(self._search_local_records(query, self.question_bank, top_k=top_k))
+            hits.extend(self._search_local_records(query, self.question_bank, top_k=top_k, source_name="question_bank"))
         if "case_bank" in selected_sources:
-            hits.extend(self._search_local_records(query, self.case_bank, top_k=top_k))
+            hits.extend(self._search_local_records(query, self.case_bank, top_k=top_k, source_name="case_bank"))
         if "common_knowledge" in selected_sources:
-            hits.extend(self._search_local_records(query, self.common_knowledge, top_k=top_k))
+            hits.extend(self._search_local_records(query, self.common_knowledge, top_k=top_k, source_name="common_knowledge"))
         if "statute" in selected_sources and self.legacy_statute is not None:
             hits.extend(self.legacy_statute.search(query, top_k=top_k))
         return sorted(hits, key=lambda hit: hit.score, reverse=True)[:top_k]
@@ -161,20 +228,14 @@ class KnowledgeService:
         normalized_question_types = self._normalize_question_types(question_types)
         strict_topic = bool(normalized_topic and normalized_topic != "综合" and effective_exam_type in {"章节练习", "薄弱点强化", "真题模拟"})
 
-        question_pool = [
-            record
-            for record in self.question_bank
-            if self._is_usable_exam_record(record)
-            and self._matches_question_types(record, normalized_question_types)
-        ]
+        question_pool = self._question_pool_from_index(normalized_question_types)
         pool = list(question_pool)
         topic_hits = []
         if normalized_topic and normalized_topic != "综合":
-            topic_hits = [record for record in pool if self._record_matches_topic(record, normalized_topic, strict=strict_topic)]
+            topic_hits = self._question_pool_from_index(normalized_question_types, topic=normalized_topic, strict=strict_topic)
             if strict_topic:
-                high_quality_hits = [record for record in topic_hits if self._strict_topic_quality(record, normalized_topic) >= 2]
-                pool = high_quality_hits or topic_hits
-            elif topic_hits and effective_exam_type == "章节练习":
+                pool = topic_hits
+            elif topic_hits:
                 pool = topic_hits
         if strict_topic and not pool:
             return []
@@ -212,8 +273,6 @@ class KnowledgeService:
 
         selected_ids = {record.record_id for record in selected}
         candidate_pool = [record for record in pool if record.record_id not in selected_ids]
-        if topic_hits and effective_exam_type != "章节练习":
-            candidate_pool = self._dedupe_records([*topic_hits, *candidate_pool])
 
         remaining = max(question_count - len(selected), 0)
         if remaining > 0:
@@ -261,6 +320,124 @@ class KnowledgeService:
 
         rng.shuffle(selected)
         return selected[:question_count]
+
+    def _build_question_indexes(self) -> None:
+        usable_question_bank: list[KnowledgeRecord] = []
+        by_type: dict[str, list[KnowledgeRecord]] = defaultdict(list)
+        loose_topic_index: dict[str, list[KnowledgeRecord]] = defaultdict(list)
+        strict_topic_index: dict[str, list[KnowledgeRecord]] = defaultdict(list)
+        loose_topic_type_index: dict[tuple[str, str], list[KnowledgeRecord]] = defaultdict(list)
+        strict_topic_type_index: dict[tuple[str, str], list[KnowledgeRecord]] = defaultdict(list)
+
+        for record in self.question_bank:
+            if not self._is_usable_exam_record(record):
+                continue
+            usable_question_bank.append(record)
+            question_type = self._question_type(record)
+            by_type[question_type].append(record)
+
+            primary_topic = self._primary_topic(record)
+            tag_topics = {
+                normalized
+                for tag in record.tags
+                for normalized in [self._normalize_topic_name(str(tag or "").strip())]
+                if normalized in CANONICAL_TOPICS and normalized != "综合"
+            }
+            loose_topics = set(tag_topics)
+            strict_topics: set[str] = set()
+            if primary_topic and primary_topic != "综合":
+                loose_topics.add(primary_topic)
+                strict_topics.add(primary_topic)
+
+            for topic in loose_topics:
+                loose_topic_index[topic].append(record)
+                loose_topic_type_index[(topic, question_type)].append(record)
+            for topic in strict_topics:
+                strict_topic_index[topic].append(record)
+                strict_topic_type_index[(topic, question_type)].append(record)
+
+        self._usable_question_bank = usable_question_bank
+        self._usable_question_type_index = dict(by_type)
+        self._usable_question_loose_topic_index = dict(loose_topic_index)
+        self._usable_question_strict_topic_index = dict(strict_topic_index)
+        self._usable_question_loose_topic_type_index = dict(loose_topic_type_index)
+        self._usable_question_strict_topic_type_index = dict(strict_topic_type_index)
+
+    def _question_pool_from_index(
+        self,
+        question_types: list[str],
+        *,
+        topic: str | None = None,
+        strict: bool = False,
+    ) -> list[KnowledgeRecord]:
+        normalized_topic = self._normalize_topic_name(topic)
+        if normalized_topic and normalized_topic != "综合":
+            if question_types:
+                index = self._usable_question_strict_topic_type_index if strict else self._usable_question_loose_topic_type_index
+                pooled: list[KnowledgeRecord] = []
+                for question_type in question_types:
+                    pooled.extend(index.get((normalized_topic, question_type), []))
+                return self._dedupe_records(pooled)
+            topic_index = self._usable_question_strict_topic_index if strict else self._usable_question_loose_topic_index
+            return list(topic_index.get(normalized_topic, []))
+
+        if question_types:
+            pooled = []
+            for question_type in question_types:
+                pooled.extend(self._usable_question_type_index.get(question_type, []))
+            return self._dedupe_records(pooled)
+        return list(self._usable_question_bank)
+
+    def _build_local_search_indexes(self) -> None:
+        self._local_search_indexes = {
+            "question_bank": self._build_local_search_index(self.question_bank),
+            "case_bank": self._build_local_search_index(self.case_bank),
+            "common_knowledge": self._build_local_search_index(self.common_knowledge),
+        }
+
+    def _build_local_search_index(self, records: list[KnowledgeRecord]) -> dict[str, object]:
+        postings: dict[str, list[int]] = defaultdict(list)
+        record_tokens: list[frozenset[str]] = []
+        for index, record in enumerate(records):
+            tokens = frozenset(self._search_index_tokens(record))
+            record_tokens.append(tokens)
+            for token in tokens:
+                postings[token].append(index)
+        return {
+            "postings": {token: tuple(indexes) for token, indexes in postings.items()},
+            "record_tokens": tuple(record_tokens),
+        }
+
+    def _search_tokens(self, text: str) -> set[str]:
+        normalized = clean_text(text)
+        if not normalized:
+            return set()
+
+        tokens = set(FAST_ALNUM_TOKEN_RE.findall(normalized.lower()))
+        for chunk in FAST_CHINESE_BLOCK_RE.findall(normalized):
+            chunk = chunk.strip()
+            if len(chunk) < 2:
+                continue
+            if len(chunk) <= 8:
+                tokens.add(chunk)
+            for window in (2, 3):
+                if len(chunk) < window:
+                    continue
+                for index in range(len(chunk) - window + 1):
+                    tokens.add(chunk[index : index + window])
+        return tokens
+
+    def _search_index_tokens(self, record: KnowledgeRecord) -> set[str]:
+        preview = truncate_text(record.content, 260)
+        parts = [record.title, preview, *record.tags]
+        return self._search_tokens("\n".join(part for part in parts if str(part or "").strip()))
+
+    def _record_search_tokens(self, source_name: str | None, record_index: int, record: KnowledgeRecord) -> set[str]:
+        if source_name:
+            search_index = self._local_search_indexes.get(source_name)
+            if search_index is not None:
+                return set(search_index["record_tokens"][record_index])
+        return self._search_index_tokens(record)
 
     def build_exam_questions(
         self,
@@ -377,13 +554,33 @@ class KnowledgeService:
             deduped.append(record)
         return deduped
 
-    def _search_local_records(self, query: str, records: list[KnowledgeRecord], *, top_k: int) -> list[KnowledgeHit]:
+    def _search_local_records(
+        self,
+        query: str,
+        records: list[KnowledgeRecord],
+        *,
+        top_k: int,
+        source_name: str | None = None,
+    ) -> list[KnowledgeHit]:
         scored: list[KnowledgeHit] = []
-        query_tokens = set(simple_tokenize(query))
-        for record in records:
-            record_tokens = set(simple_tokenize(record.title)) | set(simple_tokenize(record.content))
-            for tag in record.tags:
-                record_tokens.update(simple_tokenize(tag))
+        query_tokens = self._search_tokens(query)
+        if not query_tokens:
+            return []
+
+        candidate_indexes: Iterable[int]
+        search_index = self._local_search_indexes.get(source_name or "") if source_name else None
+        if search_index is not None:
+            candidate_set: set[int] = set()
+            postings = search_index["postings"]
+            for token in query_tokens:
+                candidate_set.update(postings.get(token, ()))
+            candidate_indexes = candidate_set or range(len(records))
+        else:
+            candidate_indexes = range(len(records))
+
+        for index in candidate_indexes:
+            record = records[index]
+            record_tokens = self._record_search_tokens(source_name, index, record)
             overlap = query_tokens & record_tokens
             if not overlap:
                 continue
@@ -487,7 +684,7 @@ class KnowledgeService:
         return 0
 
     def _is_usable_exam_record(self, record: KnowledgeRecord) -> bool:
-        question_text = str(record.title or "").strip()
+        question_text = self._normalize_exam_question_text(record)
         if not question_text or self._is_context_dependent_question(question_text):
             return False
         question_type = self._question_type(record)
@@ -505,6 +702,41 @@ class KnowledgeService:
             return True
         return any(snippet in normalized for snippet in CONTEXT_DEPENDENT_QUESTION_SNIPPETS)
 
+    def _normalize_exam_question_text(self, record: KnowledgeRecord) -> str:
+        question_text = clean_text(str(record.title or ""))
+        if not question_text:
+            return ""
+        if self._question_type(record) != "case_analysis":
+            return question_text
+        if self._has_case_analysis_action(question_text):
+            return question_text
+        if not self._looks_like_case_fact_text(question_text):
+            return ""
+        task_family = self._source_task_family(record)
+        prompt = CASE_ANALYSIS_PROMPT_BY_TASK_FAMILY.get(task_family, "请阅读以下案情，结合法律规定进行案例分析并作答：")
+        facts = clean_text(CASE_ANALYSIS_LEADING_ENUM_RE.sub("", question_text))
+        if not facts:
+            return ""
+        return f"{prompt}\n{facts}"
+
+    def _source_task_family(self, record: KnowledgeRecord) -> str:
+        source_metadata = dict(record.metadata.get("source_metadata") or {})
+        return str(source_metadata.get("task_family") or "").strip()
+
+    def _has_case_analysis_action(self, text: str) -> bool:
+        cleaned = clean_text(text)
+        if not cleaned:
+            return False
+        return any(hint in cleaned for hint in CASE_ANALYSIS_ACTION_HINTS)
+
+    def _looks_like_case_fact_text(self, text: str) -> bool:
+        cleaned = clean_text(text)
+        if not cleaned:
+            return False
+        if any(hint in cleaned for hint in CASE_ANALYSIS_FACT_HINTS):
+            return True
+        return bool(CASE_ANALYSIS_FACT_RE.search(cleaned))
+
     def _build_exam_question(
         self,
         record: KnowledgeRecord,
@@ -512,7 +744,7 @@ class KnowledgeService:
         index: int,
         requested_topic: str | None,
     ) -> dict[str, object] | None:
-        question_text = str(record.title or "").strip()
+        question_text = self._normalize_exam_question_text(record)
         if not question_text or self._is_context_dependent_question(question_text):
             return None
 
@@ -616,8 +848,8 @@ class KnowledgeService:
         return truncate_text(normalized, 160)
 
     def _comparison_key(self, text: str) -> str:
-        tokens = simple_tokenize(str(text or ""))
-        return "".join(tokens).lower()
+        normalized = clean_text(str(text or "")).lower()
+        return COMPARISON_NORMALIZE_RE.sub("", normalized)
 
     def _stable_seed(self, seed_text: str) -> int:
         digest = blake2b(str(seed_text).encode("utf-8"), digest_size=8).digest()

@@ -501,14 +501,26 @@ class UnifiedLegalAgent:
                 "feedback": "当前题目缺少参考答案，无法完成主观评分。",
                 "matched_points": [],
                 "missing_points": [],
+                "quality_level": "incorrect",
+            }
+        if not str(user_answer or "").strip():
+            return {
+                "score": 0,
+                "feedback": "未检测到作答内容。",
+                "matched_points": [],
+                "missing_points": [truncate_text(reference_answer or analysis, 160)] if (reference_answer or analysis) else [],
+                "quality_level": "incorrect",
             }
 
         model = self._load_runtime_model(model_path=None, adapter_path=None, model_device="auto")
         prompt = (
             "你是中国法考阅卷器。请依据参考答案与解析，对用户的作答进行主观评分。"
+            "评分时不要要求与参考答案逐字一致；只要结论、关键构成要件、法律分析路径在语义上基本成立，就应给出合理部分分。"
+            "只有在答案明显偏题、关键结论错误、核心要点严重缺失或完全未作答时，才应判为低分或错题。"
+            "请同时判断该题更适合归为 mastered、review、incorrect 三档中的哪一档。"
             "只输出 JSON，不要输出任何额外说明。"
             "JSON 格式固定为："
-            '{"score": 0, "feedback": "...", "matched_points": ["..."], "missing_points": ["..."]}。\n\n'
+            '{"score": 0, "feedback": "...", "matched_points": ["..."], "missing_points": ["..."], "quality_level": "mastered|review|incorrect"}。\n\n'
             f"题目类型：{question.get('question_type') or 'short_answer'}\n"
             f"题目：{question.get('question') or ''}\n"
             f"满分：{max_score}\n"
@@ -539,6 +551,16 @@ class UnifiedLegalAgent:
                 payload["feedback"] = str(payload.get("feedback") or "").strip()
                 payload["matched_points"] = [str(item) for item in payload.get("matched_points", []) if str(item).strip()][:5]
                 payload["missing_points"] = [str(item) for item in payload.get("missing_points", []) if str(item).strip()][:5]
+                quality_level = str(payload.get("quality_level") or "").strip().lower()
+                if quality_level not in {"mastered", "review", "incorrect"}:
+                    score_ratio = payload["score"] / max(max_score, 1)
+                    if score_ratio >= 0.78:
+                        quality_level = "mastered"
+                    elif score_ratio >= 0.5:
+                        quality_level = "review"
+                    else:
+                        quality_level = "incorrect"
+                payload["quality_level"] = quality_level
                 return payload
             except Exception:
                 pass
@@ -547,6 +569,7 @@ class UnifiedLegalAgent:
             "feedback": "主观评分结果解析失败，请回看参考答案与解析。",
             "matched_points": [],
             "missing_points": [truncate_text(reference_answer or analysis, 160)] if (reference_answer or analysis) else [],
+            "quality_level": "incorrect",
         }
 
     def prepare_context(
@@ -1553,51 +1576,129 @@ class UnifiedLegalAgent:
         earned_score = score_payload.get("earned_score", 0)
         total_score = score_payload.get("total_score", 0)
         wrong_questions = list(score_payload.get("wrong_questions") or [])
+        details = list(score_payload.get("details") or [])
         weak_tags = list(score_payload.get("weak_tags") or [])
         strong_tags = list(score_payload.get("strong_tags") or [])
+        mastered_count = int(score_payload.get("mastered_count") or 0)
+        review_count = int(score_payload.get("review_count") or 0)
+        incorrect_count = int(score_payload.get("incorrect_count") or 0)
+        unanswered_count = int(score_payload.get("unanswered_count") or 0)
 
-        lines = [f"本次测试得分：{score_percent} 分（{earned_score}/{total_score}）。"]
+        lines = [
+            f"本次测试得分：{score_percent} 分（{earned_score}/{total_score}）。",
+            f"评分概览：掌握较稳 {mastered_count} 题，待巩固 {review_count} 题，错题 {incorrect_count} 题，未作答 {unanswered_count} 题。",
+        ]
+        if weak_tags:
+            lines.append(f"本轮主要薄弱点：{'、'.join(weak_tags[:6])}。")
+        if strong_tags:
+            lines.append(f"本轮表现较稳的知识点：{'、'.join(strong_tags[:6])}。")
         if wrong_questions:
-            lines.append(f"本轮主要薄弱点：{'、'.join(weak_tags[:6]) or '待继续复盘'}。")
-            lines.append("以下是需要重点复盘的题目：")
-            for question in wrong_questions[:5]:
-                index = question.get("index")
-                user_answer = question.get("user_answer") or "未作答"
-                correct_answer = question.get("correct_answer") or "未提供"
-                question_type = str(question.get("question_type") or "single_choice")
-                options = dict(question.get("options") or {})
-                correct_option_text = str(options.get(correct_answer) or "").strip()
-                title = f"第{index}题" if index else "错题"
+            wrong_indexes = [str(item.get("index")) for item in wrong_questions if item.get("index")]
+            if wrong_indexes:
+                lines.append(f"已记入错题库复盘的题目：第 {'、'.join(wrong_indexes)} 题。")
+        elif incorrect_count == 0:
+            lines.append("本轮没有需要记入错题库的题目。")
+
+        if details:
+            lines.extend(["", "逐题反馈："])
+            for detail in details:
+                index = detail.get("index")
+                question_type = str(detail.get("question_type") or "single_choice")
+                type_label = {
+                    "single_choice": "单选题",
+                    "short_answer": "简答题",
+                    "case_analysis": "案例分析题",
+                }.get(question_type, question_type)
+                classification = str(detail.get("classification") or ("mastered" if detail.get("is_correct") else "incorrect"))
+                status_label = {
+                    "mastered": "掌握较稳",
+                    "review": "待巩固",
+                    "incorrect": "错题",
+                    "unanswered": "未作答",
+                }.get(classification, classification)
+                prompt = str(detail.get("question") or "").strip()
+                options = dict(detail.get("options") or {})
+                user_answer = str(detail.get("display_user_answer") or detail.get("user_answer") or "").strip()
+                correct_answer = str(detail.get("correct_answer") or "").strip()
+
+                lines.append(f"第{index}题 [{type_label}] {status_label}")
+                if prompt:
+                    lines.append(
+                        f"题干：{self._format_exam_feedback_text(prompt, question_type=question_type, field='question')}"
+                    )
+                lines.append(f"得分：{detail.get('score', 0)}/{detail.get('max_score', 20)}")
                 if question_type == "single_choice":
-                    lines.append(f"{title}：你的答案是 {user_answer}，正确答案是 {correct_answer}。")
-                    if correct_option_text:
-                        lines.append(f"正确选项内容：{correct_option_text}")
+                    lines.append(f"你的作答：{self._format_choice_answer(user_answer, options, unanswered_label='未作答')}")
+                    lines.append(f"正确答案：{self._format_choice_answer(correct_answer, options, unanswered_label='未提供')}")
                 else:
                     lines.append(
-                        f"{title}：你得了 {question.get('earned_score', 0)}/{question.get('max_score', 20)} 分。"
+                        f"你的作答：{self._format_exam_feedback_text(user_answer, question_type=question_type, field='answer') if user_answer else '未作答'}"
                     )
-                    lines.append(f"你的作答：{truncate_text(str(user_answer), 140)}")
-                    if correct_answer:
-                        lines.append(f"参考答案：{truncate_text(str(correct_answer), 200)}")
-                    feedback = str(question.get("grading_feedback") or "").strip()
+                    feedback = str(detail.get("grading_feedback") or "").strip()
                     if feedback:
-                        lines.append(f"评价：{feedback}")
-                    missing_points = [str(item) for item in question.get("missing_points", []) if str(item).strip()]
+                        lines.append(f"评语：{feedback}")
+                    matched_points = [str(item) for item in detail.get("matched_points", []) if str(item).strip()]
+                    if matched_points:
+                        lines.append(f"答到的要点：{'；'.join(matched_points[:3])}")
+                    missing_points = [str(item) for item in detail.get("missing_points", []) if str(item).strip()]
                     if missing_points:
-                        lines.append(f"欠缺要点：{'；'.join(missing_points[:3])}")
-                analysis = str(question.get("analysis") or "").strip()
+                        lines.append(f"待补要点：{'；'.join(missing_points[:3])}")
+                    if correct_answer:
+                        lines.append(
+                            f"参考要点：{self._format_exam_feedback_text(correct_answer, question_type=question_type, field='reference')}"
+                        )
+                analysis = str(detail.get("analysis") or "").strip()
                 if analysis:
-                    lines.append(f"解释：{truncate_text(analysis, 220)}")
-                prompt = str(question.get("question") or "").strip()
-                if prompt:
-                    lines.append(f"题干：{truncate_text(prompt, 120)}")
-        else:
-            lines.append("本轮没有错题，说明这套题目前掌握得比较稳。")
-            if strong_tags:
-                lines.append(f"本轮表现较稳的知识点：{'、'.join(strong_tags[:6])}。")
+                    lines.append(
+                        f"解析：{self._format_exam_feedback_text(analysis, question_type=question_type, field='analysis')}"
+                    )
+                lines.append("")
+            while lines and not lines[-1].strip():
+                lines.pop()
         if str(report_payload.get("report_path") or "").strip():
             lines.append("学习反馈报告已同步到右侧面板，并写入报告目录。")
         return "\n".join(lines)
+
+    def _format_exam_feedback_text(
+        self,
+        text: str | None,
+        *,
+        question_type: str,
+        field: str,
+    ) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return ""
+        limits = {
+            ("case_analysis", "question"): 1600,
+            ("case_analysis", "answer"): 1800,
+            ("case_analysis", "reference"): 1400,
+            ("case_analysis", "analysis"): 1400,
+            ("short_answer", "question"): 900,
+            ("short_answer", "answer"): 1200,
+            ("short_answer", "reference"): 1000,
+            ("short_answer", "analysis"): 1000,
+        }
+        limit = limits.get((question_type, field), 360)
+        if len(normalized) <= limit:
+            return normalized
+        return truncate_text(normalized, limit)
+
+    def _format_choice_answer(
+        self,
+        answer: str | None,
+        options: dict[str, Any],
+        *,
+        unanswered_label: str,
+    ) -> str:
+        normalized = str(answer or "").strip()
+        if not normalized:
+            return unanswered_label
+        label = normalized[:1].upper()
+        option_text = str(options.get(label) or "").strip()
+        if option_text:
+            return f"{label}. {option_text}"
+        return normalized
 
     def _render_exam_trace(self, tool_results: list[dict[str, Any]], answer: str) -> str:
         trace_lines: list[str] = []
