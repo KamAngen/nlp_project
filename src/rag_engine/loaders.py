@@ -17,7 +17,8 @@ def load_question_bank(path: str | Path) -> list[KnowledgeRecord]:
     records: list[KnowledgeRecord] = []
     for row in _safe_read_jsonl(path):
         record_id = str(row.get("question_id") or row.get("id") or row.get("record_id") or "")
-        stem = str(row.get("stem") or row.get("question") or "").strip()
+        title = str(row.get("title") or row.get("stem") or row.get("question") or "").strip()
+        stem = str(row.get("stem") or row.get("question") or row.get("title") or "").strip()
         options = dict(row.get("options") or {})
         option_text = " ".join(f"{key}. {value}" for key, value in options.items())
         answer = row.get("answer")
@@ -31,7 +32,7 @@ def load_question_bank(path: str | Path) -> list[KnowledgeRecord]:
             KnowledgeRecord(
                 record_id=record_id,
                 source_type="question_bank",
-                title=stem,
+                title=title or "未命名题目",
                 content=content,
                 tags=list(dict.fromkeys([topic, *tags])),
                 difficulty=str(row.get("difficulty") or "medium"),

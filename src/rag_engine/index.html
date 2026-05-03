@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Legal RAG Pro - 法律 AI 检索专家面板</title>
+    <script src="http://localhost:2266/lib/cytoscape.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #1e293b;
+            --accent: #3b82f6;
+            --bg: #f1f5f9;
+            --card: #ffffff;
+            --text: #334155;
+        }
+        body { font-family: 'Inter', 'PingFang SC', sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        
+        aside { width: 320px; background: var(--primary); color: white; padding: 25px; display: flex; flex-direction: column; overflow-y: auto; }
+        main { flex: 1; padding: 30px; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+        .card-header { padding: 15px 20px; font-weight: 700; display: flex; justify-content: space-between; align-items: center; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
+        
+        .search-container { display: flex; gap: 10px; margin-bottom: 25px; flex-shrink: 0; }
+        input[type="text"], textarea, select { 
+            width: 100%; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; 
+            font-size: 0.95rem; box-sizing: border-box; margin-bottom: 10px;
+        }
+        .btn { 
+            padding: 12px 24px; border-radius: 8px; border: none; font-weight: 600; 
+            cursor: pointer; transition: all 0.2s; white-space: nowrap;
+        }
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-primary:hover { background: #2563eb; transform: translateY(-1px); }
+        .card { 
+            background: var(--card); border-radius: 12px; padding: 0; 
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); 
+            display: flex; flex-direction: column; overflow: hidden; flex: 1; 
+        }
+        .results-list {
+            padding: 20px; 
+            overflow-y: auto; 
+            flex: 1; 
+            scrollbar-width: thin;
+            scrollbar-color: #cbd5e1 transparent;
+        }
+        .results-list::-webkit-scrollbar { width: 6px; }
+        .results-list::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .result-item { 
+            padding: 15px; border: 1px solid #e2e8f0; border-radius: 10px; 
+            margin-bottom: 15px; transition: all 0.2s; cursor: default;
+        }
+        .result-item:hover { border-color: var(--accent); box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        
+        #modal-backdrop {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(15, 23, 42, 0.75); backdrop-filter: blur(4px);
+            z-index: 999; display: none;
+        }
+        #cy-container, #detail-container { 
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 85%; height: 80%; background: white; z-index: 1000;
+            border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
+            display: none; flex-direction: column; overflow: hidden;
+        }
+        .modal-header { padding: 15px 20px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; background: #f8fafc; }
+        .close-btn { font-size: 1.5rem; cursor: pointer; color: #64748b; }
+        .close-btn:hover { color: #ef4444; }
+
+        .sidebar-section { margin-bottom: 30px; }
+        .sidebar-section h3 { font-size: 1rem; margin-bottom: 15px; display: flex; align-items: center; gap: 8px; }
+        .stat-item { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 8px; color: #cbd5e1; }
+        
+        .update-form input, .update-form textarea, .update-form select { 
+            background: #334155; border: 1px solid #475569; color: white; padding: 8px; font-size: 0.85rem;
+        }
+        .stat-badge { font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; background: #e2e8f0; color: #475569; }
+        .spinner {
+            width: 30px; height: 30px; border: 3px solid #f3f3f3;
+            border-top: 3px solid var(--accent); border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <aside>
+        <div class="sidebar-section">
+            <h3>📊 系统状态</h3>
+            <div id="stats">
+                <div class="stat-item"><span>题库总量:</span> <b id="stat-q">...</b></div>
+                <div class="stat-item"><span>案例总量:</span> <b id="stat-c">...</b></div>
+                <div class="stat-item"><span>常识总量:</span> <b id="stat-k">...</b></div>
+                <div class="stat-item"><span>语义引擎:</span> <b style="color:#4ade80">Qwen-4B</b></div>
+            </div>
+        </div>
+
+        <div class="sidebar-section">
+            <h3>🎓 智能课程采样</h3>
+            <input type="text" id="sample-topic" placeholder="知识点/关键词..." style="font-size:0.8rem;">
+            <div style="margin-bottom: 10px;">
+                <label style="font-size: 0.7rem;">掌握度: <span id="mastery-val" style="color:var(--accent)">0.5</span></label>
+                <input type="range" id="mastery-range" min="0" max="1" step="0.1" value="0.5" oninput="document.getElementById('mastery-val').innerText = this.value">
+            </div>
+            <button onclick="handleSample()" class="btn btn-primary" style="width: 100%; font-size: 0.8rem;">开始智能选题</button>
+            <div id="sample-results" style="margin-top:10px; font-size:0.75rem; background:#334155; padding:8px; border-radius:6px; color:#e2e8f0;">等待指令...</div>
+        </div>
+
+        <div class="sidebar-section update-form">
+            <h3>🆕 数据热更新</h3>
+            <select id="up-source" onchange="toggleFormFields()">
+                <option value="case_bank">⚖️ 法律案例</option>
+                <option value="question_bank" selected>📝 法律题库</option>
+                <option value="common_knowledge">📖 法律常识</option>
+            </select>
+            <input type="text" id="up-title" placeholder="标题">
+            <textarea id="up-content" placeholder="详情内容..." rows="3"></textarea>
+            <div id="fields-case" style="display:none;"><input type="text" id="up-statutes" placeholder="关联法条 (逗号分隔)"></div>
+            <div id="fields-question">
+                <select id="up-difficulty"><option value="easy">简单</option><option value="medium" selected>中等</option><option value="hard">困难</option></select>
+                <input type="text" id="up-tags" placeholder="标签 (逗号分隔)">
+            </div>
+            <button onclick="handleUpdate()" class="btn" style="width: 100%; background: #475569; color: white; margin-bottom:8px;">上传记录</button>
+            <input type="file" id="up-json-file" style="display:none" onchange="handleJsonUpload(this)">
+            <button onclick="document.getElementById('up-json-file').click()" class="btn" style="width: 100%; background: #1e293b; color: #94a3b8; border: 1px dashed #475569; font-size: 0.7rem;">📂 批量导入 JSON/JSONL</button>
+            <div id="update-progress" style="margin-top:10px; font-size:0.7rem; color:#94a3b8;"></div>
+        </div>
+    </aside>
+
+    <main>
+        <div class="column-header">
+            <h1 style="margin:0; font-size: 1.4rem;">⚖️ Legal RAG Pro 混合检索专家</h1>
+            <div style="font-size: 0.8rem; color: #64748b;">M4 Max 硬件加速 + BGE Reranker 已开启</div>
+        </div>
+
+        <div class="search-container">
+            <select id="search-source" style="width: 120px;">
+                <option value="all">全部知识</option>
+                <option value="case_bank">案例库</option>
+                <option value="question_bank">题库</option>
+                <option value="common_knowledge">常识库</option>
+            </select>
+            <select id="search-mode" style="width: 140px;" onchange="updateSearchHeader()">
+                <option value="hybrid" selected>混合检索 (Hybrid)</option>
+                <option value="lexical">传统关键词</option>
+                <option value="embedding">深度语义</option>
+            </select>
+            <input type="text" id="search-input" placeholder="输入法律问题或案例关键词..." style="flex:1;">
+            <button onclick="performSearch()" class="btn btn-primary">开始检索</button>
+        </div>
+
+        <div id="results-panel" class="card">
+            <div class="card-header" style="background: linear-gradient(135deg, #2563eb, #7c3aed); color:white; border:none;">
+                <span id="main-results-title">🚀 智能融合搜索结果 (Hybrid)</span>
+                <span id="search-timer" style="font-size:0.75rem; font-weight:normal; opacity:0.8;"></span>
+            </div>
+            <div id="results-list" class="results-list">
+                <div style="text-align:center; padding:50px; color:#94a3b8;">请输入内容并点击“开始检索”...</div>
+            </div>
+        </div>
+    </main>
+
+    <div id="modal-backdrop" onclick="closeModal()"></div>
+    <div id="cy-container">
+        <div class="modal-header"><div style="font-weight:700;">🔗 知识图谱关联分析</div><div class="close-btn" onclick="closeModal()">×</div></div>
+        <div id="graph-loading" style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); display:none; flex-direction:column; align-items:center;">
+            <div class="spinner"></div><div style="margin-top:10px; color:#64748b;">检索关联知识中...</div>
+        </div>
+        <div id="cy"></div>
+    </div>
+
+    <div id="detail-container">
+        <div class="modal-header"><div id="detail-title" style="font-weight:700;">详情</div><div class="close-btn" onclick="closeModal()">×</div></div>
+        <div id="detail-content" style="padding:20px; overflow-y:auto; flex:1; white-space:pre-wrap; font-size:0.9rem; line-height:1.6;"></div>
+        <div id="detail-meta" style="padding:12px 20px; background:#f8fafc; border-top:1px solid #e2e8f0; font-size:0.8rem; color:#64748b;"></div>
+    </div>
+
+    <script>
+        const API_BASE = "http://localhost:2266";
+        let cyInstance = null;
+
+        async function fetchStats() {
+            try {
+                const res = await fetch(`${API_BASE}/stats`);
+                const data = await res.json();
+                document.getElementById('stat-q').innerText = data.question_bank_count;
+                document.getElementById('stat-c').innerText = data.case_bank_count;
+                document.getElementById('stat-k').innerText = data.common_knowledge_count;
+            } catch(e) {}
+        }
+
+        function toggleFormFields() {
+            const s = document.getElementById('up-source').value;
+            document.getElementById('fields-case').style.display = s === 'case_bank' ? 'block' : 'none';
+            document.getElementById('fields-question').style.display = s === 'question_bank' ? 'block' : 'none';
+        }
+
+        function updateSearchHeader() {
+            const mode = document.getElementById('search-mode').value;
+            const mainTitle = document.getElementById('main-results-title');
+            if (!mainTitle) return;
+
+            if (mode === 'hybrid') {
+                mainTitle.innerHTML = '🚀 智能融合搜索结果 (Hybrid)';
+                mainTitle.parentElement.style.background = 'linear-gradient(135deg, #2563eb, #7c3aed)';
+            } else if (mode === 'lexical') {
+                mainTitle.innerHTML = '🔍 传统关键词匹配 (Lexical)';
+                mainTitle.parentElement.style.background = '#475569';
+            } else {
+                mainTitle.innerHTML = '🧠 深度语义搜索 (Embedding)';
+                mainTitle.parentElement.style.background = 'linear-gradient(135deg, #6366f1, #a855f7)';
+            }
+        }
+
+        async function performSearch() {
+            const query = document.getElementById('search-input').value;
+            const source = document.getElementById('search-source').value;
+            const mode = document.getElementById('search-mode').value;
+            if (!query) return;
+
+            updateSearchHeader(); // 确保标题是最新的
+
+            const list = document.getElementById('results-list');
+            const timer = document.getElementById('search-timer');
+            const startTime = Date.now();
+            list.innerHTML = `<div style="text-align:center; padding:50px;"><div class="spinner" style="margin:0 auto;"></div><div style="margin-top:15px; color:#64748b;">正在检索中...</div></div>`;
+
+            try {
+                const res = await fetch(`${API_BASE}/search`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        query: query, top_k: 10, mode: mode, rerank: true,
+                        sources: source === 'all' ? null : [source]
+                    })
+                });
+                const hits = await res.json();
+                timer.innerText = `耗时: ${Date.now() - startTime}ms`;
+                
+                if (!hits || hits.length === 0) {
+                    list.innerHTML = `<div style="text-align:center; padding:50px; color:#94a3b8;">未发现相关记录</div>`;
+                    return;
+                }
+
+                list.innerHTML = hits.map(hit => {
+                    const score = (hit.score * 100).toFixed(1);
+                    let badge = { text: "语义匹配", color: "#3b82f6" };
+                    if (hit.score > 0.85) badge = { text: "精准匹配", color: "#ef4444" };
+                    else if (hit.score > 0.75) badge = { text: "深度相关", color: "#10b981" };
+
+                    return `
+                        <div class="result-item">
+                            <div style="display:flex; justify-content:space-between; align-items:start; margin-bottom:8px;">
+                                <span style="font-weight:700; color:#1e293b; font-size:0.95rem;">${hit.title}</span>
+                                <span class="stat-badge" style="background:${badge.color}; color:white; border:none;">${badge.text} ${score}%</span>
+                            </div>
+                            <div style="font-size:0.85rem; color:#64748b; margin-bottom:12px;">${hit.excerpt}</div>
+                            <div style="display:flex; gap:10px; align-items:center;">
+                                <button onclick="showDetail('${hit.record_id}')" class="btn btn-primary" style="padding:4px 12px; font-size:0.75rem;">查看详情</button>
+                                <button onclick='drawGraph(${JSON.stringify(hit).replace(/'/g, "&apos;")})' class="btn" style="padding:4px 12px; font-size:0.75rem; background:#f1f5f9; color:#475569;">关联图谱</button>
+                                <span style="font-size:0.7rem; color:#94a3b8; margin-left:auto;">${hit.source_type}</span>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (e) {
+                list.innerHTML = `<div style="text-align:center; padding:50px; color:#ef4444;">❌ 连接失败: ${e.message}</div>`;
+            }
+        }
+
+        function closeModal() {
+            document.getElementById('cy-container').style.display = 'none';
+            document.getElementById('detail-container').style.display = 'none';
+            document.getElementById('modal-backdrop').style.display = 'none';
+            document.body.style.overflow = 'auto';
+        }
+
+        async function showDetail(id) {
+            const backdrop = document.getElementById('modal-backdrop');
+            const container = document.getElementById('detail-container');
+            const content = document.getElementById('detail-content');
+            const meta = document.getElementById('detail-meta');
+            
+            backdrop.style.display = 'block';
+            container.style.display = 'flex';
+            content.innerText = "加载中...";
+            
+            try {
+                const res = await fetch(`${API_BASE}/record/${id}`);
+                const data = await res.json();
+                document.getElementById('detail-title').innerText = data.title || "详情";
+                content.innerText = data.content;
+                meta.innerHTML = `<b>ID:</b> ${data.record_id} | <b>库:</b> ${data.source_type} | <b>标签:</b> ${data.tags.join(', ')}`;
+            } catch(e) { content.innerText = "加载失败: " + e.message; }
+        }
+
+        async function drawGraph(hit) {
+            console.log(">>> [Graph] Starting drawGraph for:", hit.record_id);
+            const container = document.getElementById('cy-container');
+            const backdrop = document.getElementById('modal-backdrop');
+            const loader = document.getElementById('graph-loading');
+            const cyDiv = document.getElementById('cy');
+            
+            if (typeof cytoscape === 'undefined') {
+                console.error(">>> [Graph] Cytoscape library is NOT loaded!");
+                alert("图谱引擎加载中...");
+                return;
+            }
+
+            container.style.display = 'flex';
+            backdrop.style.display = 'block';
+            loader.style.display = 'flex';
+            cyDiv.innerHTML = ""; 
+            document.body.style.overflow = 'hidden';
+
+            try {
+                const url = `${API_BASE}/graph/${hit.record_id}`;
+                console.log(">>> [Graph] Fetching data from:", url);
+                const res = await fetch(url);
+                const data = await res.json();
+                console.log(">>> [Graph] Received data:", data);
+                
+                loader.style.display = 'none';
+
+                const elements = [];
+                const rootId = data.center.id;
+                elements.push({ data: { id: rootId, label: data.center.title.substring(0,14)+'...', color: '#2563eb', size: '54px' } });
+                
+                // 1. 法条节点 (核心引用)
+                if (data.statutes && data.statutes.length > 0) {
+                    data.statutes.forEach((s, sIdx) => {
+                        const sId = `s-${sIdx}`;
+                        elements.push({ data: { id: sId, label: s, color: '#f59e0b', size: '36px' } });
+                        elements.push({ data: { source: rootId, target: sId, type: 'statute' } });
+                        
+                        // 2. 关联案例 (通过法条引出的二级关联)
+                        if (data.related_cases) {
+                            data.related_cases.forEach((rc, rIdx) => {
+                                // 简单分配：把一部分关联案例挂在特定法条下
+                                if (rIdx % data.statutes.length === sIdx) {
+                                    elements.push({ data: { id: rc.id, label: (rc.title || "案例").substring(0,10)+'...', color: '#a78bfa', size: '28px' } });
+                                    elements.push({ data: { source: sId, target: rc.id, type: 'related' } });
+                                }
+                            });
+                        }
+                    });
+                }
+                
+                // 3. 语义相似案例 (虚线关联)
+                if (data.similar_cases) {
+                    data.similar_cases.forEach((sc) => {
+                        if (!elements.find(e => e.data.id === sc.id)) {
+                            elements.push({ data: { id: sc.id, label: (sc.title || "案例").substring(0,12)+'...', color: '#8b5cf6', size: '30px' } });
+                            elements.push({ data: { source: rootId, target: sc.id, type: 'semantic' } });
+                        }
+                    });
+                }
+                
+                // 4. 语义相似题目 (虚线关联)
+                if (data.similar_questions) {
+                    data.similar_questions.forEach((sq) => {
+                        elements.push({ data: { id: sq.id, label: (sq.title || "题目").substring(0,12)+'...', color: '#ec4899', size: '30px' } });
+                        elements.push({ data: { source: rootId, target: sq.id, type: 'semantic' } });
+                    });
+                }
+
+                console.log(">>> [Graph] Final Elements for Cytoscape:", elements);
+                
+                // 强制重置样式以确保铺满
+                cyDiv.style.height = "100%"; 
+                cyDiv.style.minHeight = "0"; 
+
+                await new Promise(r => setTimeout(r, 100));
+
+                if (cyInstance) cyInstance.destroy();
+                cyInstance = cytoscape({
+                    container: cyDiv,
+                    elements: elements,
+                    style: [
+                        { selector: 'node', style: { 'background-color': 'data(color)', 'label': 'data(label)', 'font-size': '10px', 'text-valign': 'bottom', 'text-margin-y': '4px', 'width': 'mapData(size, 20, 54, 20, 48)', 'height': 'mapData(size, 20, 54, 20, 48)', 'min-width': '20px', 'min-height': '20px', 'max-width': '48px', 'max-height': '48px', 'color': '#334155', 'font-weight': '600', 'text-wrap': 'wrap', 'text-max-width': '80px', 'text-outline-width': 2, 'text-outline-color': '#ffffff' } },
+                        { selector: 'edge', style: { 'width': 2, 'line-color': '#cbd5e1', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'opacity': 0.6 } },
+                        { selector: 'edge[type="semantic"]', style: { 'line-style': 'dashed', 'line-color': '#94a3b8' } },
+                        { selector: 'edge[type="statute"]', style: { 'width': 3, 'line-color': '#f59e0b', 'opacity': 0.8 } }
+                    ],
+                    layout: { 
+                        name: 'cose', 
+                        padding: 50, 
+                        animate: true,
+                        nodeRepulsion: 10000,
+                        idealEdgeLength: 120,
+                        stop: () => { 
+                            // 布局停止后，再次执行自适应
+                            cyInstance.animate({ fit: { padding: 50 }, duration: 400 });
+                            console.log(">>> [Graph] Layout settled and fitted.");
+                        }
+                    }
+                });
+                
+                // 初始适应
+                cyInstance.fit();
+                window.addEventListener('resize', () => cyInstance.resize() && cyInstance.fit());
+            } catch (e) {
+                console.error(">>> [Graph] Render Error:", e);
+                loader.style.display = 'none';
+                cyDiv.innerHTML = `<div style="padding:20px; color:#ef4444; text-align:center;">❌ 加载失败: ${e.message}</div>`;
+            }
+        }
+
+        async function handleSample() {
+            const m = document.getElementById('mastery-range').value;
+            const t = document.getElementById('sample-topic').value;
+            const div = document.getElementById('sample-results');
+            div.innerText = "智能选题中...";
+            try {
+                const res = await fetch(`${API_BASE}/sample?mastery=${m}${t ? '&topic='+encodeURIComponent(t) : ''}`);
+                const data = await res.json();
+                div.innerHTML = data.length ? data.map(q => `• ${q.title.substring(0,20)}...`).join('<br>') : "无匹配题目";
+            } catch(e) { div.innerText = "请求失败"; }
+        }
+
+        async function handleUpdate() {
+            const source = document.getElementById('up-source').value;
+            const title = document.getElementById('up-title').value;
+            const content = document.getElementById('up-content').value;
+            if(!title || !content) return alert("请填写完整信息");
+            try {
+                const res = await fetch(`${API_BASE}/update`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ source_type: source, title, content, tags: [], metadata: {} })
+                });
+                if(res.ok) { alert("更新成功"); fetchStats(); }
+            } catch(e) { alert("连接失败"); }
+        }
+
+        async function handleJsonUpload(input) {
+            const file = input.files[0];
+            if(!file) return;
+            const div = document.getElementById('update-progress');
+            div.innerHTML = `<div style="display:flex; align-items:center; gap:10px;"><div class="spinner" style="width:16px; height:16px;"></div>正在准备上传...</div>`;
+            
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                try {
+                    let data = [];
+                    const content = e.target.result;
+                    if (file.name.endsWith('.jsonl')) {
+                        data = content.trim().split('\n').map(line => JSON.parse(line));
+                    } else {
+                        data = JSON.parse(content);
+                        if (!Array.isArray(data)) data = [data];
+                    }
+
+                    const res = await fetch(`${API_BASE}/update_batch`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(data)
+                    });
+                    const job = await res.json();
+                    if(job.task_id) pollTask(job.task_id);
+                } catch(err) { div.innerText = "文件解析失败: " + err.message; }
+            };
+            reader.readAsText(file);
+        }
+
+        async function pollTask(taskId) {
+            const div = document.getElementById('update-progress');
+            const timer = setInterval(async () => {
+                try {
+                    const res = await fetch(`${API_BASE}/task/${taskId}`);
+                    const status = await res.json();
+                    const percent = Math.round((status.processed / status.total) * 100);
+                    div.innerHTML = `
+                        <div style="font-size:0.75rem; color:#4ade80; margin-bottom:5px;">🚀 批量导入中: ${percent}%</div>
+                        <div style="width:100%; height:4px; background:#1e293b; border-radius:2px; overflow:hidden;">
+                            <div style="width:${percent}%; height:100%; background:#3b82f6; transition:width 0.3s;"></div>
+                        </div>
+                        <div style="font-size:0.65rem; color:#94a3b8; margin-top:5px;">已处理: ${status.processed} / ${status.total}</div>
+                    `;
+                    if (status.status === 'completed') {
+                        clearInterval(timer);
+                        div.innerHTML = `<div style="color:#4ade80;">✅ 导入完成 (${status.total}条)</div>`;
+                        fetchStats();
+                    }
+                } catch(e) { clearInterval(timer); div.innerText = "轮询中断"; }
+            }, 1000);
+        }
+
+        fetchStats();
+        toggleFormFields();
+    </script>
+</body>
+</html>
