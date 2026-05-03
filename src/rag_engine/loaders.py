@@ -20,10 +20,13 @@ def load_question_bank(path: str | Path) -> list[KnowledgeRecord]:
         stem = str(row.get("stem") or row.get("question") or "").strip()
         options = dict(row.get("options") or {})
         option_text = " ".join(f"{key}. {value}" for key, value in options.items())
+        answer = row.get("answer")
+        reference_answer = str(row.get("reference_answer") or "").strip()
         analysis = str(row.get("analysis") or "").strip()
         tags = [str(tag) for tag in row.get("tags", [])]
         topic = str(row.get("topic") or "综合")
-        content = "\n".join(part for part in [stem, option_text, analysis] if part)
+        question_type = str(row.get("question_type") or ("single_choice" if options else "short_answer")).strip() or "short_answer"
+        content = "\n".join(part for part in [stem, option_text, reference_answer, analysis] if part)
         records.append(
             KnowledgeRecord(
                 record_id=record_id,
@@ -33,10 +36,15 @@ def load_question_bank(path: str | Path) -> list[KnowledgeRecord]:
                 tags=list(dict.fromkeys([topic, *tags])),
                 difficulty=str(row.get("difficulty") or "medium"),
                 metadata={
-                    "answer": row.get("answer"),
+                    "answer": answer,
+                    "reference_answer": reference_answer,
                     "analysis": analysis,
                     "options": options,
                     "topic": topic,
+                    "question_type": question_type,
+                    "evaluation_mode": str(row.get("evaluation_mode") or ("objective_choice" if question_type == "single_choice" else "llm_subjective")),
+                    "references": [str(item) for item in row.get("references", [])],
+                    "source_metadata": dict(row.get("source_metadata") or {}),
                     "score": int(row.get("score", 20)),
                 },
             )

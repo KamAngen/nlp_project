@@ -632,11 +632,39 @@ class LegalAgentEngine:
         article_hits = len(re.findall(r"第[一二三四五六七八九十百千万\d]+条", text))
         return len(text) >= 260 and article_hits >= 4
 
+    def _has_meaningful_followup_answer(self, state: dict[str, Any]) -> bool:
+        analysis = dict(state.get("turn_analysis") or {})
+        current_input_role = str(analysis.get("current_input_role") or "")
+        if current_input_role not in {"supplement", "answer_to_followup", "correction"}:
+            return False
+
+        question = str(state.get("question", "") or "").strip()
+        if not question:
+            return False
+        if self._current_input_has_supplemental_facts(question):
+            return True
+        if re.search(r"\d+(?:\.\d+)?", question):
+            return True
+        return len(self._significant_tokens(question)) >= 3
+
+    def _has_contextual_retrieval_evidence(self, state: dict[str, Any]) -> bool:
+        tool_names = {str(item.get("tool_name") or "") for item in state.get("tool_history", [])}
+        return bool(tool_names & {"retrieve_from_kb", "lookup_statute", "calculator"})
+
+    def _should_skip_precise_result_review(self, state: dict[str, Any], answer: str) -> bool:
+        if not self._clarification_questions(state) or not self._has_meaningful_followup_answer(state):
+            return False
+        if self._contains_any(answer, UNCERTAINTY_MARKERS) or self._answer_looks_like_statute_dump(answer):
+            return False
+        return True
+
     def _should_review_draft_answer(self, state: dict[str, Any], answer: str) -> tuple[bool, str]:
         analysis = dict(state.get("turn_analysis") or {})
         if self._contains_any(answer, UNCERTAINTY_MARKERS):
             return True, "答案中出现了明显不确定表述，需要判断是否应继续规划。"
         if bool(analysis.get("requires_precise_result")):
+            if self._should_skip_precise_result_review(state, answer):
+                return False, ""
             return True, "用户要求精确结果，需要核查当前答案是否真正满足了精确回答需求。"
         if analysis.get("preferred_answer_style") == "brief_direct" and self._answer_looks_like_statute_dump(answer):
             return True, "当前答案疑似只是罗列法条，尚未直接回应用户最关心的问题。"
@@ -917,6 +945,16 @@ class LegalAgentEngine:
                 kind="final",
                 thought="关键事实已追问过，转为基于现有信息给出条件式分析并明确不确定项。",
                 final_answer=self._synthesize_final_answer(state, "已达到通用追问上限或出现重复追问"),
+            )
+        if (
+            prior_questions
+            and self._has_meaningful_followup_answer(state)
+            and self._has_contextual_retrieval_evidence(state)
+        ):
+            return ParsedStep(
+                kind="final",
+                thought="用户已补充关键事实，且已经完成针对性检索，转为基于现有证据给出条件式分析。",
+                final_answer=self._synthesize_final_answer(state, "补充事实后已完成检索，不再继续追加新的澄清问题"),
             )
 
         return parsed

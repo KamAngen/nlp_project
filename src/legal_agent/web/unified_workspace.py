@@ -347,7 +347,7 @@ def _submit_chat(
     yield _workspace_outputs_with_input(interim_payload, live_status=state["live_status"], question_value=question)
 
     try:
-        for update in agent.stream_message(
+        response = agent.handle_message(
             effective_question,
             user_id=user_id,
             session_id=session_id,
@@ -358,45 +358,38 @@ def _submit_chat(
             model_device=model_device,
             allow_button_only_intents=False,
             display_question=question,
-        ):
-            if update.get("event") == "final":
-                response = update["response"]
-                state["trace"] = response.trace
-                state["report_markdown"] = response.report_markdown or state.get("report_markdown") or ""
-                state["report_path"] = response.report_path or state.get("report_path")
-                state["last_assistant_message"] = response.answer
-                state["live_status"] = "已完成分析。"
-                if response.needs_user_input and response.clarification_question:
-                    state["pending_question"] = response.clarification_question
-                    state["clarification_answers"] = clarification_answers
-                    state["pending_root_question"] = str(state.get("pending_root_question") or question)
-                else:
-                    state["pending_question"] = None
-                    state["clarification_answers"] = []
-                    state["pending_root_question"] = None
+        )
+        state["trace"] = response.trace
+        state["report_markdown"] = response.report_markdown or state.get("report_markdown") or ""
+        state["report_path"] = response.report_path or state.get("report_path")
+        state["last_assistant_message"] = response.answer
+        state["live_status"] = "已完成分析。"
+        final_chat = list(live_chat)
+        final_chat[-1] = {"role": "assistant", "content": response.answer}
+        if response.needs_user_input and response.clarification_question:
+            state["pending_question"] = response.clarification_question
+            state["clarification_answers"] = clarification_answers
+            state["pending_root_question"] = str(state.get("pending_root_question") or question)
+        else:
+            state["pending_question"] = None
+            state["clarification_answers"] = []
+            state["pending_root_question"] = None
 
-                final_payload = _refresh_workspace_data(
-                    state,
-                    config_path=config_path,
-                    study_config_path=study_config_path,
-                    runtime_device=runtime_device,
-                    default_retrieval_device=default_retrieval_device,
-                )
-                yield _workspace_outputs_with_input(final_payload, live_status=state["live_status"], question_value="")
-                return
-
-            stage_message = str(update.get("message") or "正在处理中。")
-            live_chat[-1] = {"role": "assistant", "content": stage_message}
-            state["trace"] = str(update.get("trace") or state.get("trace") or "")
-            state["last_assistant_message"] = stage_message
-            state["live_status"] = stage_message
-            stage_payload = dict(base_payload)
-            stage_payload["chat_messages"] = list(live_chat)
-            stage_payload["trace"] = state["trace"]
-            stage_payload["state"] = state
-            stage_payload["reply_copy_text"] = stage_message
-            stage_payload["live_status"] = stage_message
-            yield _workspace_outputs_with_input(stage_payload, live_status=stage_message, question_value=question)
+        final_payload = dict(base_payload)
+        final_payload["chat_messages"] = final_chat
+        final_payload["trace"] = state["trace"]
+        final_payload["state"] = state
+        final_payload["report_display_markdown"] = _render_report_panel(str(state.get("report_markdown") or ""))
+        final_payload["report_path"] = state.get("report_path")
+        final_payload["user_choices"] = list(base_payload["user_choices"])
+        final_payload["user_value"] = user_id
+        final_payload["session_choices"] = list(base_payload["session_choices"])
+        final_payload["session_value"] = session_id
+        final_payload["reply_copy_text"] = response.answer
+        final_payload["report_copy_text"] = str(state.get("report_markdown") or "")
+        final_payload["live_status"] = state["live_status"]
+        yield _workspace_outputs_with_input(final_payload, live_status=state["live_status"], question_value="")
+        return
     except Exception as exc:
         error_message = f"处理失败：{exc}"
         live_chat[-1] = {"role": "assistant", "content": error_message}

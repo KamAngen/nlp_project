@@ -189,9 +189,9 @@ class TrajectoryBuilder:
         if scenario in {"study_qa", "study_case_analysis", "study_method_qa", "study_statute_qa"}:
             steps.append(
                 {
-                    "thought": "先读取用户当前记忆，了解复习背景和薄弱点。",
-                    "tool_name": "memory_search",
-                    "tool_args": {"query": seed.question, "top_k": 6},
+                    "thought": "先整理当前用户画像、会话摘要和相关历史命中。",
+                    "tool_name": "prepare_context",
+                    "tool_args": {"query": seed.question},
                 }
             )
             steps.append(
@@ -228,9 +228,9 @@ class TrajectoryBuilder:
                         "tool_args": {},
                     },
                     {
-                        "thought": "再看近期会话记忆，决定题目主题和难点。",
-                        "tool_name": "memory_search",
-                        "tool_args": {"query": topic, "top_k": 6},
+                        "thought": "先整理当前画像和会话摘要，决定题目主题和难点。",
+                        "tool_name": "prepare_context",
+                        "tool_args": {"query": topic},
                     },
                     {
                         "thought": "现在可以为用户生成一套模拟测试。",
@@ -245,9 +245,9 @@ class TrajectoryBuilder:
             steps.extend(
                 [
                     {
-                        "thought": "先读取当前记忆、画像和会话摘要，为报告收集材料。",
-                        "tool_name": "memory_search",
-                        "tool_args": {"query": report_type, "top_k": 8},
+                        "thought": "先整理当前记忆、画像和会话摘要，为报告收集材料。",
+                        "tool_name": "prepare_context",
+                        "tool_args": {"query": report_type},
                     },
                     {
                         "thought": "基于当前快照生成结构化学习报告。",

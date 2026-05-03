@@ -270,6 +270,87 @@ def test_uncertain_final_answer_is_converted_to_followup_question():
     assert updated.tool_args["question"] == "请补充解除原因、你的月工资和工作年限。"
 
 
+def test_precise_followup_answer_does_not_trigger_irrelevant_second_followup():
+    engine = LegalAgentEngine(
+        _DummyModel(
+            [
+                'Thought: 我还想继续追问。\nAction: ask_user({"question": "事故发生后是否有人报警？是否有人目击事故现场？", "field_name": "accident_details"})'
+            ]
+        ),
+        _DummyRegistry(),
+        max_steps=4,
+    )
+    parsed = ParsedStep(
+        kind="final",
+        thought="已有补充事实足以给出条件式分析。",
+        final_answer="结合现有信息，小明的行为已高度接近交通肇事后逃逸并致一人死亡，通常会在三年以上七年以下有期徒刑幅度内量刑；具体还要看责任划分和是否存在其他加重、减轻情节。",
+    )
+    state = {
+        "question": "导致一人不治身亡，小明逃跑了",
+        "history": [("小明在路上撞了人，要判多少年？", "为继续分析，请先补充：事故是否导致他人重伤？是否逃逸？")],
+        "tool_history": [
+            {
+                "tool_name": "ask_user",
+                "tool_args": {"question": "事故是否导致他人重伤？是否逃逸？", "field_name": "accident_facts"},
+                "result": {"status": "pending_user_input"},
+            }
+        ],
+        "turn_analysis": {
+            "current_input_role": "answer_to_followup",
+            "requires_precise_result": True,
+            "preferred_answer_style": "brief_direct",
+        },
+        "scratchpad": "Observation: 已检索交通肇事罪与逃逸量刑规则。",
+    }
+
+    updated = engine._postprocess_parsed_step(state, parsed)
+
+    assert updated.kind == "final"
+    assert "三年以上七年以下" in updated.final_answer
+
+
+def test_followup_answer_after_retrieval_forces_final_synthesis_instead_of_new_ask_user():
+    engine = _build_engine()
+    parsed = ParsedStep(
+        kind="tool",
+        thought="我还想继续追问一个新事实。",
+        tool_name="ask_user",
+        tool_args={"question": "事故发生后是否有人报警？是否有人目击事故现场？", "field_name": "accident_details"},
+    )
+    state = {
+        "question": "导致一人不治身亡，小明逃跑了",
+        "history": [("小明在路上撞了人，要判多少年？", "为继续分析，请先补充：事故是否导致他人受伤？是否逃逸？")],
+        "tool_history": [
+            {
+                "tool_name": "ask_user",
+                "tool_args": {"question": "事故是否导致他人受伤？是否逃逸？", "field_name": "accident_facts"},
+                "result": {"status": "pending_user_input"},
+            },
+            {
+                "tool_name": "retrieve_from_kb",
+                "tool_args": {"query": "交通肇事 逃逸 致人死亡 量刑", "top_k": 6},
+                "result": {"results": [{"document_title": "中华人民共和国刑法"}]},
+            },
+            {
+                "tool_name": "lookup_statute",
+                "tool_args": {"title": "中华人民共和国刑法"},
+                "result": {"title": "中华人民共和国刑法", "content": "交通肇事罪相关法条"},
+            },
+        ],
+        "turn_analysis": {
+            "current_input_role": "answer_to_followup",
+            "requires_precise_result": True,
+            "preferred_answer_style": "brief_direct",
+        },
+        "scratchpad": "Observation: 已检索交通肇事罪与逃逸量刑规则。",
+    }
+
+    updated = engine._postprocess_parsed_step(state, parsed)
+
+    assert updated.kind == "final"
+    assert "当前信息仍不足以形成可靠法律结论" not in updated.final_answer
+
+
 def test_retrieval_query_uses_only_supplemental_answers_not_prior_questions():
     engine = _build_engine()
     question = (

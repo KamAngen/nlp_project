@@ -11,4 +11,12 @@ legacy_config_path: configs/defaults.yaml
 retrieval_top_k: 6
 default_exam_question_count: 5
 planner_backend: llm_react
-turn_analysis_mode: heuristic
+turn_analysis_mode: llm
+memory:
+  recent_turn_window: 8
+  compression_after_turns: 10
+  compression_chunk_size: 8
+  retain_recent_turns: 6
+  vectorizer: embedding
+  embedding_model_path: models/embeddings/bge-small-zh
+  embedding_device: cpu

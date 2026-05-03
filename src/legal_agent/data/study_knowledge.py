@@ -24,7 +24,7 @@ CHOICE_MARKER_RE = re.compile(r"(?<![A-Za-z])([A-D])[.．、]\s*")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])\s*")
 CLAUSE_SPLIT_RE = re.compile(r"(?<=[，,：:])\s*")
 NON_WORD_RE = re.compile(r"[\s，,。；;：:！!？?（）()《》“”\"'、]+")
-TOPIC_ORDER = ("民法", "刑法", "行政法", "民诉", "刑诉", "商经", "理论法")
+TOPIC_ORDER = ("民法", "刑法", "行政法", "民诉", "刑诉", "商经", "理论法", "综合")
 CHOICE_STEM_HINTS = (
     "下列",
     "以下",
@@ -102,8 +102,55 @@ TOPIC_KEYWORDS = {
     "行政法": ("行政法", "行政处罚", "行政许可", "行政复议", "行政机关", "听证", "行政赔偿", "强制", "政府"),
     "民诉": ("民事诉讼", "民诉", "管辖", "起诉", "保全", "执行", "证据", "再审", "调解"),
     "刑诉": ("刑事诉讼", "刑诉", "侦查", "起诉", "审判", "辩护", "取保候审", "证据排除", "羁押"),
-    "商经": ("公司法", "证券法", "破产法", "保险法", "票据", "税法", "合伙", "商经", "反垄断", "消费者"),
+    "商经": ("公司法", "证券法", "证券投资基金法", "破产法", "保险法", "票据", "税法", "合伙", "商经", "反垄断", "消费者"),
     "理论法": ("宪法", "法理", "立法法", "法律效力", "法律原则", "法治", "法制史", "司法制度", "理论法"),
+}
+TOPIC_REFERENCE_KEYWORDS = {
+    "民法": ("民法典", "合同法", "物权法", "侵权责任", "婚姻", "继承", "担保", "不动产登记"),
+    "刑法": ("刑法", "治安管理处罚法", "交通肇事", "诈骗罪", "盗窃罪", "抢劫罪", "受贿罪", "故意杀人罪"),
+    "行政法": ("行政处罚法", "行政许可法", "行政复议法", "行政强制法", "国家赔偿法", "政府信息公开", "行政诉讼法"),
+    "民诉": ("民事诉讼法", "仲裁法", "劳动争议调解仲裁法", "农村土地承包经营纠纷调解仲裁法", "人民调解法"),
+    "刑诉": ("刑事诉讼法", "公安机关办理刑事案件程序规定", "人民检察院刑事诉讼规则", "非法证据排除"),
+    "商经": ("公司法", "证券法", "证券投资基金法", "保险法", "票据法", "企业破产法", "合伙企业法", "反垄断法", "消费者权益保护法", "税收征收管理法"),
+    "理论法": ("宪法", "立法法", "法官法", "检察官法", "监察法", "法律职业道德"),
+}
+TOPIC_STRONG_KEYWORDS = {
+    "民法": ("押金", "租赁", "买卖合同", "借款", "担保", "侵权", "婚姻", "继承", "物权", "不当得利", "无因管理"),
+    "刑法": ("诈骗罪", "盗窃罪", "抢劫罪", "故意伤害", "故意杀人", "交通肇事", "量刑", "刑罚", "缓刑", "自首", "共同犯罪"),
+    "行政法": ("行政处罚", "行政许可", "行政复议", "行政强制", "听证", "政府信息公开", "行政机关", "行政赔偿", "行政诉讼"),
+    "民诉": ("民事诉讼", "管辖", "起诉", "诉前保全", "财产保全", "证据保全", "执行异议", "再审", "调解书", "小额诉讼", "申请执行"),
+    "刑诉": ("刑事诉讼", "侦查", "辩护权", "取保候审", "羁押", "非法证据排除", "强制措施", "公诉", "不起诉", "讯问"),
+    "商经": ("公司法", "证券法", "证券投资基金", "票据", "破产", "保险", "合伙", "反垄断", "消费者权益", "税率", "股东会", "董事会"),
+    "理论法": ("宪法", "法理", "立法法", "法律效力", "法治", "司法制度", "法律原则", "法制史", "监察"),
+}
+TOPIC_WEAK_KEYWORDS = {
+    "民法": ("赔偿", "违约"),
+    "刑法": ("犯罪", "罪名"),
+    "行政法": ("处罚", "许可", "复议", "听证"),
+    "民诉": ("执行", "调解", "仲裁", "证据"),
+    "刑诉": ("羁押", "侦查", "辩护"),
+    "商经": ("基金", "公司", "证券", "消费者", "税"),
+    "理论法": ("规范", "原则", "效力"),
+}
+QUESTION_TYPE_BY_TASK_FAMILY = {
+    "exam": "single_choice",
+    "legal_question_answering": "short_answer",
+    "jud_read_compre": "case_analysis",
+    "judgement_predit": "case_analysis",
+    "sent_pred": "short_answer",
+    "sim_case_match": "case_analysis",
+    "leg_case_cls": "case_analysis",
+    "jud_doc_sum": "case_analysis",
+}
+QUESTION_TYPE_LABELS = {
+    "single_choice": "单选题",
+    "short_answer": "简答题",
+    "case_analysis": "案例分析题",
+}
+EVALUATION_MODE_BY_QUESTION_TYPE = {
+    "single_choice": "objective_choice",
+    "short_answer": "llm_subjective",
+    "case_analysis": "llm_subjective",
 }
 GENERIC_DISTRACTORS = {
     "民法": [
@@ -297,6 +344,20 @@ STATIC_SYSTEM_MEMORIES = [
         "tags": ["memory", "profile"],
     },
     {
+        "id": "system-memory-02",
+        "category": "memory_policy",
+        "text": "写入用户画像、长期记忆和系统记忆时，应基于整轮对话语义理解判断价值，不依赖“我叫”“我在备考”等固定句式匹配。",
+        "importance": 0.97,
+        "tags": ["memory", "llm_reasoning"],
+    },
+    {
+        "id": "system-memory-03",
+        "category": "memory_policy",
+        "text": "只有会长期影响代理行为的稳定规则才应写入 system memory；用户个人偏好和个人档案应写入 profile 或 long_term，不要混层。",
+        "importance": 0.95,
+        "tags": ["memory", "system_boundary"],
+    },
+    {
         "id": "system-exam-01",
         "category": "exam_policy",
         "text": "模拟测试默认按百分制展示成绩，并在评分后提炼薄弱知识点，写回用户画像与学习报告。",
@@ -309,6 +370,13 @@ STATIC_SYSTEM_MEMORIES = [
         "text": "错题库中的题目应在后续练习中被随机回放，答对后再从错题库移除。",
         "importance": 0.92,
         "tags": ["exam", "wrong_question_bank"],
+    },
+    {
+        "id": "system-exam-03",
+        "category": "exam_policy",
+        "text": "评分后除了分数，还应对错题给出正确答案、题目解释和下一步复习提示；如果全对，也应总结本轮强项。",
+        "importance": 0.94,
+        "tags": ["exam", "feedback"],
     },
     {
         "id": "system-retrieval-01",
@@ -331,14 +399,20 @@ STATIC_SYSTEM_MEMORIES = [
 class StudyCandidate:
     sample_id: str
     topic: str
+    topic_confidence: int
+    topic_evidence: list[str]
     question: str
+    question_type: str
+    evaluation_mode: str
     answer: str
     answer_summary: str
+    reference_answer: str
     analysis: str
     references: list[str]
     tags: list[str]
     task_family: str
     difficulty: str
+    subset_name: str
     source_options: dict[str, str] | None = None
     source_answer_label: str | None = None
 
@@ -354,18 +428,20 @@ def prepare_study_knowledge_assets(
     app_config: AppConfig,
     study_config: StudyAgentConfig,
     *,
-    question_count: int = 180,
-    case_count: int = 96,
+    question_count: int = 0,
+    case_count: int = 0,
     common_count: int = 24,
     force_rebuild: bool = False,
     auto_download_disc_law: bool = False,
 ) -> dict[str, Any]:
     existing = _study_asset_status(study_config)
     required_system_count = max(len(STATIC_SYSTEM_MEMORIES), 6)
+    use_all_questions = question_count <= 0
+    use_all_cases = case_count <= 0
     if (
         not force_rebuild
-        and existing["question_count"] >= question_count
-        and existing["case_count"] >= case_count
+        and (use_all_questions or existing["question_count"] >= question_count)
+        and (use_all_cases or existing["case_count"] >= case_count)
         and existing["common_count"] >= common_count
         and existing["system_count"] >= required_system_count
     ):
@@ -374,21 +450,21 @@ def prepare_study_knowledge_assets(
     disc_path = _ensure_disc_law_normalized(app_config, auto_download_disc_law=auto_download_disc_law)
     catalog_rows = _read_law_catalog_rows(app_config)
 
-    question_pools, case_pools = _collect_candidate_pools(
-        disc_path,
-        question_capacity_per_topic=max(question_count, 72),
-        case_capacity_per_topic=max(case_count, 48),
-    )
-    question_candidates = _select_candidates(question_pools, question_count + max(24, question_count // 4))
-    case_candidates = _select_candidates(case_pools, case_count + max(12, case_count // 4))
+    question_pools, case_pools = _collect_candidate_pools(disc_path)
+    all_question_candidates = _flatten_candidate_pools(question_pools)
+    all_case_candidates = _flatten_candidate_pools(case_pools)
+    question_target = len(all_question_candidates) if use_all_questions else question_count
+    case_target = len(all_case_candidates) if use_all_cases else case_count
+    question_candidates = all_question_candidates if use_all_questions else _select_candidates(question_pools, question_target)
+    case_candidates = all_case_candidates if use_all_cases else _select_candidates(case_pools, case_target)
 
-    preserved_questions = _load_preserved_jsonl_rows(study_config.question_bank_path, "question_id", "auto-q-")
-    preserved_cases = _load_preserved_jsonl_rows(study_config.case_bank_path, "case_id", "auto-case-")
-    preserved_common = _load_preserved_jsonl_rows(study_config.common_knowledge_path, "entry_id", "auto-common-")
+    preserved_questions = [] if force_rebuild else _load_preserved_jsonl_rows(study_config.question_bank_path, "question_id", "auto-q-")
+    preserved_cases = [] if force_rebuild else _load_preserved_jsonl_rows(study_config.case_bank_path, "case_id", "auto-case-")
+    preserved_common = [] if force_rebuild else _load_preserved_jsonl_rows(study_config.common_knowledge_path, "entry_id", "auto-common-")
     preserved_system = _load_preserved_system_rows(study_config.system_memory_path, "auto-system-")
 
-    question_rows = _build_question_bank_rows(question_candidates, preserved_questions, question_target=question_count)
-    case_rows = _build_case_bank_rows(case_candidates, preserved_cases, case_target=case_count)
+    question_rows = _build_question_bank_rows(question_candidates, preserved_questions, question_target=question_target)
+    case_rows = _build_case_bank_rows(case_candidates, preserved_cases, case_target=case_target)
     common_rows = _build_common_knowledge_rows(
         question_candidates,
         case_candidates,
@@ -405,6 +481,7 @@ def prepare_study_knowledge_assets(
     write_json(study_config.system_memory_path, system_rows)
 
     topic_counts = Counter(row.get("topic") or "综合" for row in question_rows)
+    question_type_counts = Counter(row.get("question_type") or "unknown" for row in question_rows)
     return {
         "generated": True,
         "question_count": len(question_rows),
@@ -416,6 +493,7 @@ def prepare_study_knowledge_assets(
         "common_knowledge_path": str(study_config.common_knowledge_path),
         "system_memory_path": str(study_config.system_memory_path),
         "topic_distribution": {topic: topic_counts[topic] for topic in TOPIC_ORDER if topic_counts[topic]},
+        "question_type_distribution": {question_type: question_type_counts[question_type] for question_type in sorted(question_type_counts)},
         "catalog_row_count": len(catalog_rows),
         "disc_law_normalized_path": str(disc_path),
     }
@@ -471,15 +549,9 @@ def _read_law_catalog_rows(app_config: AppConfig) -> list[dict[str, str]]:
         return [{str(key): str(value or "").strip() for key, value in row.items()} for row in reader]
 
 
-def _collect_candidate_pools(
-    disc_path: Path,
-    *,
-    question_capacity_per_topic: int,
-    case_capacity_per_topic: int,
-) -> tuple[dict[str, list[StudyCandidate]], dict[str, list[StudyCandidate]]]:
-    question_heaps: dict[str, list[tuple[int, int, StudyCandidate]]] = defaultdict(list)
-    case_heaps: dict[str, list[tuple[int, int, StudyCandidate]]] = defaultdict(list)
-    sequence = 0
+def _collect_candidate_pools(disc_path: Path) -> tuple[dict[str, list[StudyCandidate]], dict[str, list[StudyCandidate]]]:
+    question_pools: dict[str, list[StudyCandidate]] = defaultdict(list)
+    case_pools: dict[str, list[StudyCandidate]] = defaultdict(list)
 
     with disc_path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -490,40 +562,49 @@ def _collect_candidate_pools(
             candidate = _candidate_from_disc_record(row)
             if candidate is None:
                 continue
-            score = _stable_score(candidate.sample_id)
             if candidate.task_family in QUESTION_TASK_FAMILIES:
-                _push_candidate(question_heaps[candidate.topic], score, sequence, candidate, question_capacity_per_topic)
-                sequence += 1
+                question_pools[candidate.topic].append(candidate)
             if candidate.task_family in CASE_TASK_FAMILIES:
-                _push_candidate(case_heaps[candidate.topic], score, sequence, candidate, case_capacity_per_topic)
-                sequence += 1
+                case_pools[candidate.topic].append(candidate)
 
-    return _finalize_candidate_heaps(question_heaps), _finalize_candidate_heaps(case_heaps)
-
-
-def _push_candidate(
-    heap: list[tuple[int, int, StudyCandidate]],
-    score: int,
-    sequence: int,
-    candidate: StudyCandidate,
-    capacity: int,
-) -> None:
-    entry = (-score, sequence, candidate)
-    if len(heap) < capacity:
-        heappush(heap, entry)
-        return
-    if score < -heap[0][0]:
-        heapreplace(heap, entry)
+    return _finalize_candidate_pools(question_pools), _finalize_candidate_pools(case_pools)
 
 
-def _finalize_candidate_heaps(
-    heaps: dict[str, list[tuple[int, int, StudyCandidate]]],
+def _finalize_candidate_pools(
+    pools: dict[str, list[StudyCandidate]],
 ) -> dict[str, list[StudyCandidate]]:
     finalized: dict[str, list[StudyCandidate]] = {}
-    for topic, heap in heaps.items():
-        ordered = sorted(heap, key=lambda item: (-item[0], item[1]))
-        finalized[topic] = [candidate for _, _, candidate in ordered]
+    for topic, candidates in pools.items():
+        deduped: list[StudyCandidate] = []
+        seen_keys: set[tuple[str, str, str]] = set()
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.question_type != "single_choice",
+                -candidate.topic_confidence,
+                -len(candidate.references),
+                _stable_score(candidate.sample_id),
+            ),
+        )
+        for candidate in ordered:
+            dedupe_key = (candidate.question_type, candidate.question, candidate.answer_summary)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            deduped.append(candidate)
+        finalized[topic] = deduped
     return finalized
+
+
+def _flatten_candidate_pools(pools: dict[str, list[StudyCandidate]]) -> list[StudyCandidate]:
+    flattened: list[StudyCandidate] = []
+    for topic in TOPIC_ORDER:
+        flattened.extend(pools.get(topic, []))
+    for topic, candidates in pools.items():
+        if topic in TOPIC_ORDER:
+            continue
+        flattened.extend(candidates)
+    return flattened
 
 
 def _candidate_from_disc_record(row: dict[str, Any]) -> StudyCandidate | None:
@@ -538,11 +619,13 @@ def _candidate_from_disc_record(row: dict[str, Any]) -> StudyCandidate | None:
     parsed_choice = _parse_choice_question(question, answer)
     source_options: dict[str, str] | None = None
     source_answer_label: str | None = None
+    question_type = _infer_question_type(task_family, parsed_choice=parsed_choice, question=question, answer=answer)
     if parsed_choice is not None:
         question = _compact_choice_question(parsed_choice.stem)
         if not question:
             return None
         answer_summary = parsed_choice.options[parsed_choice.answer_label]
+        reference_answer = clean_text(answer_summary)
         analysis = _build_analysis_text(answer, correct_text=answer_summary)
         source_options = parsed_choice.options
         source_answer_label = parsed_choice.answer_label
@@ -551,30 +634,35 @@ def _candidate_from_disc_record(row: dict[str, Any]) -> StudyCandidate | None:
         if not question:
             return None
         answer_summary = _answer_summary(answer)
+        reference_answer = _build_reference_answer(answer)
         analysis = _build_analysis_text(answer, correct_text=answer_summary)
-    if len(answer_summary) < 12:
+    if parsed_choice is None and len(answer_summary) < 12:
         return None
     if len(analysis) < 12:
         analysis = answer_summary
     references = _extract_reference_titles(list(row.get("references") or []))
     references.extend(_extract_reference_titles([answer]))
     references = list(dict.fromkeys(references))[:4]
-    topic = _infer_topic(question, answer, references)
-    if topic == "综合":
-        return None
-    tags = _build_tags(topic, question, answer, references)
+    topic, topic_confidence, topic_evidence = _infer_topic(question, answer, references)
+    tags = _build_tags(topic, question, answer, references, question_type=question_type)
     difficulty = _infer_difficulty(task_family, question, answer)
     return StudyCandidate(
         sample_id=str(row.get("sample_id") or "unknown"),
         topic=topic,
+        topic_confidence=topic_confidence,
+        topic_evidence=topic_evidence,
         question=question,
+        question_type=question_type,
+        evaluation_mode=EVALUATION_MODE_BY_QUESTION_TYPE.get(question_type, "llm_subjective"),
         answer=answer,
         answer_summary=answer_summary,
+        reference_answer=reference_answer,
         analysis=analysis,
         references=references,
         tags=tags,
         task_family=task_family,
         difficulty=difficulty,
+        subset_name=str(row.get("subset_name") or "unknown"),
         source_options=source_options,
         source_answer_label=source_answer_label,
     )
@@ -619,7 +707,8 @@ def _compact_freeform_question(text: str, *, max_chars: int = 220) -> str:
     for segment in _split_sentences(cleaned):
         if len(segment) <= max_chars and any(hint in segment for hint in CHOICE_STEM_HINTS):
             return segment
-    return ""
+    summarized = _summarize_complete_text(cleaned, max_chars=max_chars, max_sentences=2, allow_clause_split=False)
+    return summarized or cleaned[:max_chars].rstrip(" ，,；;：:")
 
 
 def _compact_choice_question(text: str, *, max_chars: int = 520) -> str:
@@ -648,6 +737,22 @@ def _parse_choice_question(question: str, answer: str) -> ParsedChoiceQuestion |
     if answer_label is None:
         return None
     return ParsedChoiceQuestion(stem=stem, options=options, answer_label=answer_label)
+
+
+def _infer_question_type(
+    task_family: str,
+    *,
+    parsed_choice: ParsedChoiceQuestion | None,
+    question: str,
+    answer: str,
+) -> str:
+    if parsed_choice is not None:
+        return "single_choice"
+    if task_family in {"jud_read_compre", "judgement_predit", "sim_case_match", "leg_case_cls", "jud_doc_sum"}:
+        return "case_analysis"
+    if len(question) >= 120 or len(answer) >= 360:
+        return "case_analysis"
+    return QUESTION_TYPE_BY_TASK_FAMILY.get(task_family, "short_answer")
 
 
 def _extract_choice_options(question: str) -> tuple[str, dict[str, str]] | None:
@@ -735,21 +840,67 @@ def _extract_reference_titles(references: list[str]) -> list[str]:
     return titles
 
 
-def _infer_topic(question: str, answer: str, references: list[str]) -> str:
-    corpus = " ".join([question, answer, *references])
-    for topic, keywords in TOPIC_KEYWORDS.items():
-        if any(keyword in corpus for keyword in keywords):
-            return topic
-    token_set = set(simple_tokenize(corpus))
-    for topic, keywords in TOPIC_KEYWORDS.items():
-        if any(keyword in token_set for keyword in keywords):
-            return topic
-    return "综合"
+def _score_topic_matches(text: str, keywords: tuple[str, ...]) -> int:
+    normalized = clean_text(text)
+    if not normalized:
+        return 0
+    compact = NON_WORD_RE.sub("", normalized).lower()
+    hits = 0
+    for keyword in keywords:
+        value = clean_text(keyword)
+        if not value:
+            continue
+        value_compact = NON_WORD_RE.sub("", value).lower()
+        if value in normalized or (value_compact and value_compact in compact):
+            hits += 1
+    return hits
 
 
-def _build_tags(topic: str, question: str, answer: str, references: list[str]) -> list[str]:
+def _infer_topic(question: str, answer: str, references: list[str]) -> tuple[str, int, list[str]]:
+    question_text = clean_text(question)
+    answer_text = clean_text(answer)
+    reference_text = " ".join(clean_text(item) for item in references if clean_text(item))
+    extracted_titles = list(dict.fromkeys([*references, *_extract_reference_titles([question_text, answer_text])]))
+
+    scores: Counter[str] = Counter()
+    evidence: defaultdict[str, list[str]] = defaultdict(list)
+    for topic in TOPIC_KEYWORDS:
+        reference_hits = _score_topic_matches(" ".join(extracted_titles) + " " + reference_text, TOPIC_REFERENCE_KEYWORDS.get(topic, ()))
+        question_hits = _score_topic_matches(question_text, TOPIC_KEYWORDS.get(topic, ()))
+        answer_hits = _score_topic_matches(answer_text, TOPIC_STRONG_KEYWORDS.get(topic, ()))
+        weak_hits = _score_topic_matches(question_text + " " + answer_text, TOPIC_WEAK_KEYWORDS.get(topic, ()))
+        if reference_hits:
+            scores[topic] += reference_hits * 8
+            evidence[topic].append(f"reference:{reference_hits}")
+        if question_hits:
+            scores[topic] += question_hits * 4
+            evidence[topic].append(f"question:{question_hits}")
+        if answer_hits:
+            scores[topic] += answer_hits * 2
+            evidence[topic].append(f"answer:{answer_hits}")
+        if weak_hits:
+            scores[topic] += weak_hits
+            evidence[topic].append(f"weak:{weak_hits}")
+
+    if not scores:
+        return "综合", 0, []
+
+    ordered = sorted(scores.items(), key=lambda item: (item[1], -TOPIC_ORDER.index(item[0]) if item[0] in TOPIC_ORDER else -999), reverse=True)
+    best_topic, best_score = ordered[0]
+    runner_score = ordered[1][1] if len(ordered) > 1 else 0
+    if best_score < 3:
+        return "综合", best_score, list(evidence.get(best_topic) or [])[:4]
+    if best_score < 8 and best_score - runner_score < 2:
+        return "综合", best_score, list(evidence.get(best_topic) or [])[:4]
+    return best_topic, best_score, list(evidence.get(best_topic) or [])[:6]
+
+
+def _build_tags(topic: str, question: str, answer: str, references: list[str], *, question_type: str) -> list[str]:
     tags = [topic]
     tags.extend(references[:2])
+    question_type_label = QUESTION_TYPE_LABELS.get(question_type)
+    if question_type_label and question_type_label not in tags:
+        tags.append(question_type_label)
     corpus = question + " " + answer
     for keyword in TOPIC_KEYWORDS.get(topic, ()):
         if keyword in corpus and keyword not in tags:
@@ -765,6 +916,14 @@ def _infer_difficulty(task_family: str, question: str, answer: str) -> str:
     if task_family in {"legal_question_answering", "sent_pred", "sim_case_match"}:
         return "medium"
     return "easy"
+
+
+def _build_reference_answer(answer: str, *, max_chars: int = 680) -> str:
+    normalized = clean_text(answer)
+    if not normalized:
+        return ""
+    summarized = _summarize_complete_text(normalized, max_chars=max_chars, max_sentences=4, allow_clause_split=False)
+    return summarized or truncate_text(normalized, max_chars)
 
 
 def _answer_summary(answer: str, *, max_chars: int = 90) -> str:
@@ -965,33 +1124,49 @@ def _build_question_bank_rows(
 ) -> list[dict[str, Any]]:
     rows = [dict(row) for row in preserved_rows]
     seen_ids = {str(row.get("question_id") or "") for row in rows}
-    seen_questions = {str(row.get("question") or "") for row in rows}
+    seen_questions = {
+        f"{str(row.get('question_type') or 'single_choice')}::{str(row.get('question') or '')}"
+        for row in rows
+    }
 
     for candidate in candidates:
         if len(rows) >= question_target:
             break
         question_id = _question_record_id(candidate)
-        if question_id in seen_ids or candidate.question in seen_questions:
+        dedupe_key = f"{candidate.question_type}::{candidate.question}"
+        if question_id in seen_ids or dedupe_key in seen_questions:
             continue
         if candidate.source_options and candidate.source_answer_label:
             options = dict(candidate.source_options)
-            answer_label = candidate.source_answer_label
+            answer_value = candidate.source_answer_label
         else:
-            options, answer_label = _build_question_options(candidate)
+            options = {}
+            answer_value = candidate.answer_summary
         row = {
             "question_id": question_id,
             "topic": candidate.topic,
+            "question_type": candidate.question_type,
+            "evaluation_mode": candidate.evaluation_mode,
             "difficulty": candidate.difficulty,
             "question": candidate.question,
             "options": options,
-            "answer": answer_label,
+            "answer": answer_value,
+            "reference_answer": candidate.reference_answer,
             "analysis": candidate.analysis,
             "tags": candidate.tags,
+            "references": candidate.references,
+            "source_metadata": {
+                "sample_id": candidate.sample_id,
+                "subset_name": candidate.subset_name,
+                "task_family": candidate.task_family,
+                "topic_confidence": candidate.topic_confidence,
+                "topic_evidence": candidate.topic_evidence,
+            },
             "score": 20,
         }
         rows.append(row)
         seen_ids.add(question_id)
-        seen_questions.add(candidate.question)
+        seen_questions.add(dedupe_key)
     return rows
 
 

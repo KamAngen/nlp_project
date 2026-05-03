@@ -84,9 +84,9 @@ class _DummyEngine:
 
         if "生成一套" in question or "调用 generate_exam" in question or "模拟测试" in question:
             profile = self.agent.tool_executor.execute("profile_view", {}, user_id=self.user_id, session_id=self.session_id)
-            memory = self.agent.tool_executor.execute(
-                "memory_search",
-                {"query": "行政法", "top_k": 6},
+            context = self.agent.tool_executor.execute(
+                "prepare_context",
+                {"query": "行政法"},
                 user_id=self.user_id,
                 session_id=self.session_id,
             )
@@ -98,7 +98,7 @@ class _DummyEngine:
             )
             tool_history = [
                 {"tool_name": "profile_view", "reason": "读取画像", "arguments": {}, "result": profile},
-                {"tool_name": "memory_search", "reason": "读取记忆", "arguments": {"query": "行政法", "top_k": 6}, "result": memory},
+                {"tool_name": "prepare_context", "reason": "整理上下文", "arguments": {"query": "行政法"}, "result": context},
                 {"tool_name": "generate_exam", "reason": "生成模拟题", "arguments": {"topic": "行政法", "question_count": 1}, "result": exam},
             ]
             return SimpleNamespace(
@@ -146,6 +146,22 @@ class _DummyEngine:
         )
 
 
+class _StreamingEngine:
+    def run_with_updates(self, question: str, history=None):
+        yield {"event": "status", "message": "正在整理最终答复。", "trace": "Final Answer: 草稿答案"}
+        yield {
+            "event": "final",
+            "result": SimpleNamespace(
+                final_answer="草稿答案",
+                trace="Final Answer: 草稿答案",
+                tool_history=[],
+                errors=[],
+                needs_user_input=False,
+                clarification_question=None,
+            ),
+        }
+
+
 def test_study_agent_unified_workflow(tmp_path: Path, monkeypatch):
     agent = LegalStudyAgent(_build_config(tmp_path))
     monkeypatch.setattr(
@@ -165,7 +181,7 @@ def test_study_agent_unified_workflow(tmp_path: Path, monkeypatch):
     assert exam_result.intent == "mock_exam_generate"
     assert "请按“1.A 2.B 3.C”这样的格式" in exam_result.answer
     assert score_result.intent == "mock_exam_score"
-    assert "本次测试得分为" in score_result.answer
+    assert "本次测试得分" in score_result.answer
     assert score_result.report_path is not None
     assert qa_result.intent == "legal_qa"
     assert "法考学习" in qa_result.answer
@@ -240,6 +256,179 @@ def test_generate_exam_button_uses_direct_tool_trace(tmp_path: Path):
     assert '"analysis"' in response.trace
 
 
+def test_score_response_explains_wrong_answers(tmp_path: Path, monkeypatch):
+    agent = LegalStudyAgent(_build_config(tmp_path))
+
+    class _NoToolEngine:
+        def run(self, question: str, history=None):
+            return SimpleNamespace(
+                final_answer="模型未主动调用工具。",
+                trace="Final Answer: 模型未主动调用工具。",
+                tool_history=[],
+                errors=[],
+                needs_user_input=False,
+                clarification_question=None,
+            )
+
+    monkeypatch.setattr(agent, "_build_engine", lambda **kwargs: _NoToolEngine())
+
+    agent.memory_manager.record_exam_session(
+        "demo_user",
+        "demo_session",
+        {
+            "exam_session_id": "exam-1",
+            "topic": "行政法",
+            "exam_type": "综合练习",
+            "questions": [
+                {
+                    "index": 1,
+                    "record_id": "q-1",
+                    "topic": "行政法",
+                    "question": "收到信息更正请求后应如何处理？",
+                    "options": {
+                        "A": "可以忽略",
+                        "B": "核实身份后及时提供查询、更正或删除",
+                        "C": "统一拖延处理",
+                        "D": "只保留纸面登记",
+                    },
+                    "answer": "B",
+                    "analysis": "电子商务经营者在收到用户的信息更正、删除请求后，应当先核实身份，再及时处理。",
+                    "tags": ["行政法", "电子商务法"],
+                    "score": 20,
+                }
+            ],
+        },
+    )
+
+    response = agent.handle_message("1.A", user_id="demo_user", session_id="demo_session")
+
+    assert response.intent == "mock_exam_score"
+    assert "正确答案是 B" in response.answer
+    assert "解释：" in response.answer
+    assert "学习反馈报告已同步到右侧面板" in response.answer
+
+
+def test_render_exam_answer_surfaces_selection_notes_and_non_misleading_profile_copy(tmp_path: Path):
+    agent = LegalStudyAgent(_build_config(tmp_path))
+
+    answer = agent._render_exam_answer(
+        [
+            {"tool_name": "profile_view", "result": {"profile": {"weak_points": [], "study_goals": []}}},
+            {
+                "tool_name": "generate_exam",
+                "result": {
+                    "topic": "民诉",
+                    "exam_type": "章节练习",
+                    "question_count": 1,
+                    "reused_wrong_question_count": 0,
+                    "selection_notes": ["当前题库中与民诉严格匹配且通过校验的题目不足 2 题，本次返回 1 题，未使用跨主题题目凑数。"],
+                    "questions": [
+                        {
+                            "index": 1,
+                            "question": "申请诉前财产保全通常应满足什么条件？",
+                            "options": {
+                                "A": "申请人应证明情况紧急，并依法提供担保。",
+                                "B": "只能在败诉后申请。",
+                                "C": "必须先经过行政机关批准。",
+                                "D": "无需证明任何紧急性。",
+                            },
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+
+    assert "当前画像暂无额外选题标签" in answer
+    assert "未使用跨主题题目凑数" in answer
+
+
+def test_direct_fallback_scores_answer_sheet_before_profile_updates(tmp_path: Path, monkeypatch):
+    agent = LegalStudyAgent(_build_config(tmp_path))
+
+    class _NoToolEngine:
+        def run(self, question: str, history=None):
+            return SimpleNamespace(
+                final_answer="模型未主动调用工具。",
+                trace="Final Answer: 模型未主动调用工具。",
+                tool_history=[],
+                errors=[],
+                needs_user_input=False,
+                clarification_question=None,
+            )
+
+    monkeypatch.setattr(agent, "_build_engine", lambda **kwargs: _NoToolEngine())
+    monkeypatch.setattr(
+        agent.memory_manager,
+        "extract_profile_updates_for_user",
+        lambda *args, **kwargs: {"study_goals": ["行政法"], "preferences": {"response_length": "短"}},
+    )
+
+    agent.memory_manager.record_exam_session(
+        "demo_user",
+        "demo_session",
+        {
+            "exam_session_id": "exam-1",
+            "topic": "行政法",
+            "exam_type": "综合练习",
+            "questions": [
+                {
+                    "index": 1,
+                    "record_id": "q-1",
+                    "topic": "行政法",
+                    "question": "收到信息更正请求后应如何处理？",
+                    "options": {"A": "可以忽略", "B": "核实身份后及时处理", "C": "统一拖延", "D": "只做登记"},
+                    "answer": "B",
+                    "analysis": "应核实身份后及时处理。",
+                    "tags": ["行政法"],
+                    "score": 20,
+                }
+            ],
+        },
+    )
+
+    response = agent.handle_message("1.A", user_id="demo_user", session_id="demo_session")
+
+    assert response.intent == "mock_exam_score"
+    assert response.tool_results[0]["tool_name"] == "score_exam"
+    assert all(entry["tool_name"] != "profile_upsert" for entry in response.tool_results)
+
+
+def test_direct_profile_update_fallback_uses_synthesized_answer(tmp_path: Path, monkeypatch):
+    agent = LegalStudyAgent(_build_config(tmp_path))
+
+    class _NoToolEngine:
+        def run(self, question: str, history=None):
+            return SimpleNamespace(
+                final_answer="模型未主动调用工具。",
+                trace="Final Answer: 模型未主动调用工具。",
+                tool_history=[],
+                errors=[],
+                needs_user_input=False,
+                clarification_question=None,
+            )
+
+    monkeypatch.setattr(agent, "_build_engine", lambda **kwargs: _NoToolEngine())
+    monkeypatch.setattr(
+        agent.memory_manager,
+        "extract_profile_updates_for_user",
+        lambda *args, **kwargs: {"study_goals": ["民法"], "preferences": {"response_length": "简洁"}},
+    )
+    monkeypatch.setattr(
+        agent,
+        "_synthesize_tool_based_answer",
+        lambda question, tool_results, **kwargs: "记住了，你当前主要复习民法，后续我会尽量简洁回答，并继续围绕这个方向辅导。",
+    )
+
+    response = agent.handle_message("最近主要复习民法，后续答复尽量简洁一点。", user_id="demo_user", session_id="demo_session")
+
+    assert response.intent == "profile_update"
+    assert response.answer.startswith("记住了，你当前主要复习民法")
+    assert response.tool_results[0]["tool_name"] == "profile_upsert"
+    assert response.tool_results[1]["tool_name"] == "profile_view"
+    assert response.tool_results[2]["tool_name"] == "prepare_context"
+
+
 def test_study_agent_falls_back_to_direct_rag_when_model_skips_tools(tmp_path: Path, monkeypatch):
     agent = LegalStudyAgent(_build_config(tmp_path))
 
@@ -255,17 +444,76 @@ def test_study_agent_falls_back_to_direct_rag_when_model_skips_tools(tmp_path: P
             )
 
     monkeypatch.setattr(agent, "_build_engine", lambda **kwargs: _NoToolEngine())
+    monkeypatch.setattr(
+        agent,
+        "_synthesize_tool_based_answer",
+        lambda question, tool_results, **kwargs: "根据当前检索到的题库解析和学习材料，押金到期无正当抵扣事由时原则上应当返还；如果你愿意，我可以继续按法条依据展开。",
+    )
 
     response = agent.handle_message("押金到期不退怎么办？", user_id="demo_user", session_id="demo_session")
 
     assert response.intent == "legal_qa"
     assert response.tool_results
-    assert response.tool_results[0]["tool_name"] == "memory_search"
+    assert response.tool_results[0]["tool_name"] == "prepare_context"
     assert response.tool_results[1]["tool_name"] == "rag_search"
     assert "[statute]" not in response.answer
     assert "[question_bank]" not in response.answer
     assert response.trace.count("Final Answer:") == 1
     assert response.trace.endswith(response.answer)
+
+
+def test_study_agent_prepare_context_returns_planning_payload(tmp_path: Path, monkeypatch):
+    agent = LegalStudyAgent(_build_config(tmp_path))
+    monkeypatch.setattr(
+        agent,
+        "_build_engine",
+        lambda **kwargs: _DummyEngine(agent, user_id=kwargs["user_id"], session_id=kwargs["session_id"]),
+    )
+
+    agent.handle_message("记住，我在备考民法，我的薄弱点是行政法。", user_id="demo_user", session_id="demo_session")
+    payload = agent.prepare_context("请继续围绕行政法给我出题", user_id="demo_user", session_id="demo_session")
+
+    assert payload["long_term_hits"]
+    assert payload["related_hits"]
+    assert "长期用户画像" in payload["planning_context"]
+
+
+def test_study_agent_stream_message_yields_final_before_background_persistence(tmp_path: Path, monkeypatch):
+    agent = LegalStudyAgent(_build_config(tmp_path))
+    monkeypatch.setattr(agent, "_ensure_memory_reasoner", lambda **kwargs: None)
+    monkeypatch.setattr(agent, "_normalize_runtime_question", lambda question, **kwargs: question)
+    monkeypatch.setattr(agent, "_session_history", lambda *args, **kwargs: [])
+    monkeypatch.setattr(agent, "_build_engine", lambda **kwargs: _StreamingEngine())
+    monkeypatch.setattr(
+        agent,
+        "_finalize_response",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("stream_message should not call _finalize_response directly")),
+    )
+
+    persisted_answers: list[str] = []
+    monkeypatch.setattr(
+        agent,
+        "_persist_response_turn_async",
+        lambda **kwargs: persisted_answers.append(kwargs["response"].answer),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_compose_response",
+        lambda *args, **kwargs: StudyAgentResponse(
+            intent="legal_qa",
+            answer="这是最终答复",
+            plan={"planner_backend": "llm_react"},
+            tool_results=[],
+            trace="Final Answer: 这是最终答复",
+        ),
+    )
+
+    updates = list(agent.stream_message("什么是听证程序", user_id="demo_user", session_id="demo_session"))
+
+    assert updates[0]["event"] == "status"
+    assert updates[-1]["event"] == "final"
+    assert updates[-1]["response"].answer == "这是最终答复"
+    assert persisted_answers == ["这是最终答复"]
 
 
 def test_study_agent_preserves_smalltalk_when_direct_rag_has_no_strong_hits(tmp_path: Path, monkeypatch):
@@ -287,7 +535,7 @@ def test_study_agent_preserves_smalltalk_when_direct_rag_has_no_strong_hits(tmp_
     response = agent.handle_message("你好", user_id="demo_user", session_id="demo_session")
 
     assert response.intent == "legal_qa"
-    assert [entry["tool_name"] for entry in response.tool_results[:2]] == ["memory_search", "rag_search"]
+    assert [entry["tool_name"] for entry in response.tool_results[:2]] == ["prepare_context", "rag_search"]
     assert response.answer == "你好，我是你的法考学习助手。"
     assert response.trace.endswith(response.answer)
 
