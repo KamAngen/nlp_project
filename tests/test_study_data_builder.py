@@ -4,7 +4,7 @@ import csv
 from pathlib import Path
 
 from legal_agent.config import AppConfig, GenerationConfig, InferenceConfig, ModelsConfig, RetrievalConfig, TrainingConfig
-from legal_agent.data.study_knowledge import prepare_study_knowledge_assets
+from legal_agent.data.study_knowledge import _candidate_from_disc_record, prepare_study_knowledge_assets
 from legal_agent.study_config import StudyAgentConfig
 from legal_agent.utils.io import read_json, read_jsonl, write_json, write_jsonl
 from rag_engine.loaders import load_question_bank
@@ -315,6 +315,52 @@ def test_prepare_study_knowledge_assets_keeps_explicit_single_choice_options(tmp
     rendered = explicit_row["question"] + "\n" + "\n".join(explicit_row["options"].values()) + "\n" + explicit_row["analysis"]
     assert "…" not in rendered
     assert "解析：" not in rendered
+
+
+def test_prepare_study_knowledge_assets_emits_structured_question_types_when_rebuilding_all(tmp_path: Path):
+    app_config = _app_config(tmp_path)
+    study_config = _study_config(tmp_path)
+    _seed_disc_law(tmp_path)
+    _seed_catalog(tmp_path)
+
+    summary = prepare_study_knowledge_assets(
+        app_config,
+        study_config,
+        question_count=0,
+        case_count=0,
+        common_count=8,
+        force_rebuild=True,
+    )
+
+    question_rows = list(read_jsonl(study_config.question_bank_path))
+    auto_rows = [row for row in question_rows if str(row.get("question_id") or "").startswith("auto-q-")]
+
+    assert summary["generated"] is True
+    assert summary["question_type_distribution"].get("single_choice", 0) >= 1
+    assert summary["question_type_distribution"].get("short_answer", 0) >= 1
+    assert auto_rows
+    assert all(str(row.get("question_type") or "").strip() for row in auto_rows)
+    assert all(str(row.get("evaluation_mode") or "").strip() for row in auto_rows)
+    assert all(str(row.get("reference_answer") or "").strip() for row in auto_rows)
+    assert all(isinstance(row.get("source_metadata"), dict) for row in auto_rows)
+
+
+def test_candidate_topic_inference_prefers_reference_law_over_generic_mediation_keyword():
+    candidate = _candidate_from_disc_record(
+        {
+            "sample_id": "fund-mediation-001",
+            "task_family": "exam",
+            "subset_name": "DISC-Law-SFT-Pair",
+            "instruction": "某投资公司在基金业务中出现纠纷，想寻求调解。可以向哪个机构寻求帮助？ A. 基金业协会 B. 人民法院 C. 市场监督管理部门 D. 公安机关",
+            "answer": "A. 基金业协会 解析：该题实质对应证券投资基金法下的行业调解，应优先按照证券投资基金法体系识别，而不是仅因出现调解字样就归入民诉。",
+            "references": ["《中华人民共和国证券投资基金法》"],
+        }
+    )
+
+    assert candidate is not None
+    assert candidate.topic == "商经"
+    assert candidate.question_type == "single_choice"
+    assert any("证券投资基金法" in reference for reference in candidate.references)
 
 
 def test_prepare_study_knowledge_assets_skips_when_existing_counts_are_sufficient(tmp_path: Path):

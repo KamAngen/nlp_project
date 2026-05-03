@@ -11,6 +11,8 @@ from legal_agent.agent.tools import ToolRegistry, observation_to_text
 from legal_agent.models.qwen_local import LocalQwenChatModel
 from legal_agent.utils.text import simple_tokenize
 
+from planning_engine.planner import StudyPlanner
+
 
 QUERY_STOPWORDS = {
     "怎么",
@@ -89,6 +91,7 @@ class LegalAgentEngine:
         enable_thinking: bool = False,
         prompt_mode: str = "pure",
         turn_analysis_mode: str = "heuristic",
+        use_planning_engine: bool = False,
     ) -> None:
         self.model = model
         self.registry = registry
@@ -105,6 +108,8 @@ class LegalAgentEngine:
         self.enable_thinking = enable_thinking
         self.prompt_mode = prompt_mode
         self.turn_analysis_mode = turn_analysis_mode
+        self.use_planning_engine = use_planning_engine
+        self.planner = StudyPlanner(enable_logging=True) if use_planning_engine else None
         self.system_prompt = build_system_prompt(
             self.registry.tool_definitions(),
             stepwise=True,
@@ -189,10 +194,36 @@ class LegalAgentEngine:
 
     def _initial_state(self, question: str, history: list[tuple[str, str]] | None = None) -> dict[str, Any]:
         normalized_history = history or []
+        turn_analysis = self._resolve_turn_analysis(question, normalized_history)
+
+        if turn_analysis.get("should_stop_current_task"):
+            return {
+                "question": question,
+                "history": normalized_history,
+                "turn_analysis": turn_analysis,
+                "scratchpad": "用户主动停止当前任务。",
+                "step_count": 0,
+                "tool_history": [],
+                "errors": [],
+                "final_answer": "好的，已停止当前任务。有什么其他问题需要帮助吗？",
+            }
+
+        if turn_analysis.get("intent") == "general_qa":
+            return {
+                "question": question,
+                "history": normalized_history,
+                "turn_analysis": turn_analysis,
+                "scratchpad": "通用问题，由 LLM 直接回答。",
+                "step_count": 0,
+                "tool_history": [],
+                "errors": [],
+                "skip_tools": True,
+            }
+
         return {
             "question": question,
             "history": normalized_history,
-            "turn_analysis": self._resolve_turn_analysis(question, normalized_history),
+            "turn_analysis": turn_analysis,
             "scratchpad": "",
             "step_count": 0,
             "llm_retry_count": 0,
@@ -202,12 +233,44 @@ class LegalAgentEngine:
         }
 
     def _resolve_turn_analysis(self, question: str, history: list[tuple[str, str]]) -> dict[str, Any]:
+        if self.use_planning_engine and self.planner:
+            return self._resolve_turn_analysis_with_planner(question, history)
         if self.turn_analysis_mode != "llm":
             return self._default_turn_analysis(question, history)
         try:
             return self._analyze_user_turn(question, history)
         except Exception:
             return self._default_turn_analysis(question, history)
+
+    def _resolve_turn_analysis_with_planner(self, question: str, history: list[tuple[str, str]]) -> dict[str, Any]:
+        from context_engine.schemas import ContextBundle, SessionState, UserProfile
+
+        context = ContextBundle(
+            user_profile=UserProfile(user_id="default", study_goals=[], weak_points=[]),
+            session_state=SessionState(session_id="default", user_id="default"),
+            layer_hits={},
+            summary_blocks={},
+        )
+
+        analysis = self.planner.analyze_turn(question, context, history=history)
+
+        return {
+            "current_input_role": analysis.get("current_input_role", "new_question"),
+            "user_goal": analysis.get("user_goal", ""),
+            "needs_history": analysis.get("needs_history", bool(history)),
+            "history_usage": analysis.get("history_usage", ""),
+            "requires_precise_result": analysis.get("requires_precise_result", False),
+            "preferred_answer_style": analysis.get("preferred_answer_style", "brief_direct"),
+            "likely_missing_info": analysis.get("likely_missing_info", []),
+            "recommended_next_step": analysis.get("recommended_next_step", "unknown"),
+            "intent": analysis.get("intent", "legal_qa"),
+            "intent_confidence": analysis.get("intent_confidence", 0.0),
+            "should_stop_current_task": analysis.get("should_stop_current_task", False),
+            "clarification_question": analysis.get("clarification_question"),
+            "is_domain_switch": analysis.get("is_domain_switch", False),
+            "domain_switch_from": analysis.get("domain_switch_from"),
+            "domain_switch_to": analysis.get("domain_switch_to"),
+        }
 
     def _run_state_machine(self, state: dict[str, Any]) -> dict[str, Any]:
         while True:
@@ -569,11 +632,39 @@ class LegalAgentEngine:
         article_hits = len(re.findall(r"第[一二三四五六七八九十百千万\d]+条", text))
         return len(text) >= 260 and article_hits >= 4
 
+    def _has_meaningful_followup_answer(self, state: dict[str, Any]) -> bool:
+        analysis = dict(state.get("turn_analysis") or {})
+        current_input_role = str(analysis.get("current_input_role") or "")
+        if current_input_role not in {"supplement", "answer_to_followup", "correction"}:
+            return False
+
+        question = str(state.get("question", "") or "").strip()
+        if not question:
+            return False
+        if self._current_input_has_supplemental_facts(question):
+            return True
+        if re.search(r"\d+(?:\.\d+)?", question):
+            return True
+        return len(self._significant_tokens(question)) >= 3
+
+    def _has_contextual_retrieval_evidence(self, state: dict[str, Any]) -> bool:
+        tool_names = {str(item.get("tool_name") or "") for item in state.get("tool_history", [])}
+        return bool(tool_names & {"retrieve_from_kb", "lookup_statute", "calculator"})
+
+    def _should_skip_precise_result_review(self, state: dict[str, Any], answer: str) -> bool:
+        if not self._clarification_questions(state) or not self._has_meaningful_followup_answer(state):
+            return False
+        if self._contains_any(answer, UNCERTAINTY_MARKERS) or self._answer_looks_like_statute_dump(answer):
+            return False
+        return True
+
     def _should_review_draft_answer(self, state: dict[str, Any], answer: str) -> tuple[bool, str]:
         analysis = dict(state.get("turn_analysis") or {})
         if self._contains_any(answer, UNCERTAINTY_MARKERS):
             return True, "答案中出现了明显不确定表述，需要判断是否应继续规划。"
         if bool(analysis.get("requires_precise_result")):
+            if self._should_skip_precise_result_review(state, answer):
+                return False, ""
             return True, "用户要求精确结果，需要核查当前答案是否真正满足了精确回答需求。"
         if analysis.get("preferred_answer_style") == "brief_direct" and self._answer_looks_like_statute_dump(answer):
             return True, "当前答案疑似只是罗列法条，尚未直接回应用户最关心的问题。"
@@ -855,6 +946,16 @@ class LegalAgentEngine:
                 thought="关键事实已追问过，转为基于现有信息给出条件式分析并明确不确定项。",
                 final_answer=self._synthesize_final_answer(state, "已达到通用追问上限或出现重复追问"),
             )
+        if (
+            prior_questions
+            and self._has_meaningful_followup_answer(state)
+            and self._has_contextual_retrieval_evidence(state)
+        ):
+            return ParsedStep(
+                kind="final",
+                thought="用户已补充关键事实，且已经完成针对性检索，转为基于现有证据给出条件式分析。",
+                final_answer=self._synthesize_final_answer(state, "补充事实后已完成检索，不再继续追加新的澄清问题"),
+            )
 
         return parsed
 
@@ -1008,6 +1109,8 @@ class LegalAgentEngine:
         return state
 
     def _route_after_llm(self, state: dict[str, Any]) -> str:
+        if state.get("skip_tools"):
+            return "final"
         if state.get("parsed_kind") == "final":
             return "final"
         if state.get("parsed_kind") == "tool":

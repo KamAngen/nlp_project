@@ -3,19 +3,25 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 import json
+import logging
 from pathlib import Path
 import re
+import threading
 from typing import Any
 
 from context_engine.manager import MemoryManager
+from context_engine.reasoner import QwenMemoryReasoner
 from context_engine.schemas import utcnow_iso
 from context_engine.store import DiskMemoryStore
+from context_engine.vectorizer import HashingVectorizer, TransformerVectorizer
 from legal_agent.agent.engine import AgentRunResult, LegalAgentEngine
+from legal_agent.agent.parser import parse_react_output
+from legal_agent.agent.tools import observation_to_text
 from legal_agent.config import AppConfig, load_app_config
 from legal_agent.models.qwen_local import LocalQwenChatModel
 from legal_agent.rag.retriever import HybridLegalRetriever
 from legal_agent.study_config import StudyAgentConfig
-from legal_agent.study_tools import ANSWER_LINE_RE, StudyToolExecutor
+from legal_agent.study_tools import INLINE_CHOICE_ANSWER_RE, NUMBERED_ANSWER_BLOCK_RE, StudyToolExecutor
 from legal_agent.unified_tools import UnifiedToolRegistry
 from legal_agent.utils.text import simple_tokenize, truncate_text
 from rag_engine.service import KnowledgeService
@@ -55,6 +61,8 @@ SMALLTALK_MARKERS = (
     "谢谢",
     "多谢",
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -118,6 +126,11 @@ class UnifiedLegalAgent:
         self.memory_manager = MemoryManager(
             self.memory_store,
             system_seed_path=config.system_memory_path,
+            vectorizer=self._build_memory_vectorizer(retrieval_device),
+            recent_turn_window=config.memory.recent_turn_window,
+            compression_after_turns=config.memory.compression_after_turns,
+            compression_chunk_size=config.memory.compression_chunk_size,
+            retain_recent_turns=config.memory.retain_recent_turns,
         )
         self.knowledge_service = KnowledgeService(
             question_bank_path=config.question_bank_path,
@@ -131,9 +144,19 @@ class UnifiedLegalAgent:
             self.memory_manager,
             self.knowledge_service,
             report_root=config.report_root,
+            subjective_exam_grader=self._grade_subjective_exam,
         )
         self.legal_config_path = str((config.legacy_config_path or (config.project_root / "configs" / "defaults.yaml")).resolve())
         self.legal_config = _load_legal_config_cached(self.legal_config_path)
+
+    def _build_memory_vectorizer(self, retrieval_device: str):
+        backend = str(self.config.memory.vectorizer or "hashing").strip().lower()
+        if backend != "embedding" or self.config.memory.embedding_model_path is None:
+            return HashingVectorizer()
+        embedding_device = str(self.config.memory.embedding_device or "cpu").strip().lower()
+        if embedding_device == "auto":
+            embedding_device = retrieval_device if retrieval_device and retrieval_device != "auto" else "cpu"
+        return TransformerVectorizer(self.config.memory.embedding_model_path, device=embedding_device)
 
     def handle_message(
         self,
@@ -161,6 +184,7 @@ class UnifiedLegalAgent:
                 )
 
         retrieval_device = retrieval_device or self.default_retrieval_device
+        self._ensure_memory_reasoner(model_path=model_path, adapter_path=adapter_path, model_device=model_device)
         effective_question = self._normalize_runtime_question(question, user_id=user_id, session_id=session_id)
         history = self._session_history(user_id, session_id)
         engine = self._build_engine(
@@ -182,6 +206,9 @@ class UnifiedLegalAgent:
             retrieval_device=retrieval_device,
             prompt_mode=prompt_mode,
             display_question=display_question,
+            model_path=model_path,
+            adapter_path=adapter_path,
+            model_device=model_device,
         )
 
     def stream_message(
@@ -212,6 +239,7 @@ class UnifiedLegalAgent:
                 return
 
         retrieval_device = retrieval_device or self.default_retrieval_device
+        self._ensure_memory_reasoner(model_path=model_path, adapter_path=adapter_path, model_device=model_device)
         effective_question = self._normalize_runtime_question(question, user_id=user_id, session_id=session_id)
         history = self._session_history(user_id, session_id)
         engine = self._build_engine(
@@ -237,7 +265,7 @@ class UnifiedLegalAgent:
         if final_result is None:
             raise RuntimeError("统一 Agent 流式执行未返回最终结果。")
 
-        response = self._finalize_response(
+        response = self._compose_response(
             question,
             effective_question=effective_question,
             result=final_result,
@@ -246,8 +274,17 @@ class UnifiedLegalAgent:
             retrieval_device=retrieval_device,
             prompt_mode=prompt_mode,
             display_question=display_question,
+            model_path=model_path,
+            adapter_path=adapter_path,
+            model_device=model_device,
         )
         yield {"event": "final", "message": response.answer, "trace": response.trace, "response": response}
+        self._persist_response_turn_async(
+            user_id=user_id,
+            session_id=session_id,
+            user_message=display_question or question,
+            response=response,
+        )
 
     def generate_exam(
         self,
@@ -257,6 +294,7 @@ class UnifiedLegalAgent:
         topic: str | None = None,
         question_count: int | None = None,
         exam_type: str | None = None,
+        question_types: list[str] | None = None,
         model_path: str | None = None,
         adapter_path: str | None = None,
         prompt_mode: str = "pure",
@@ -267,12 +305,14 @@ class UnifiedLegalAgent:
         effective_count = int(question_count or self.config.default_exam_question_count)
         effective_exam_type = (exam_type or "综合练习").strip() or "综合练习"
         self._ensure_user_session(user_id, session_id)
+        self._ensure_memory_reasoner(model_path=model_path, adapter_path=adapter_path, model_device=model_device)
         return self._direct_generate_exam_response(
             user_id=user_id,
             session_id=session_id,
             topic=effective_topic,
             question_count=effective_count,
             exam_type=effective_exam_type,
+            question_types=question_types,
         )
 
     def generate_report(self, *, user_id: str = "default_user", session_id: str = "default_session", report_type: str = "study_progress") -> dict[str, Any]:
@@ -296,6 +336,7 @@ class UnifiedLegalAgent:
         model_device: str = "auto",
     ) -> StudyAgentResponse:
         self._ensure_user_session(user_id, session_id)
+        self._ensure_memory_reasoner(model_path=model_path, adapter_path=adapter_path, model_device=model_device)
         return self._direct_generate_report_response(
             user_id=user_id,
             session_id=session_id,
@@ -376,8 +417,6 @@ class UnifiedLegalAgent:
         model_device: str,
     ) -> LegalAgentEngine:
         retriever = _get_retriever_cached(self.legal_config_path, retrieval_device)
-        resolved_model_path = self.legal_config.resolve_project_path(model_path) if model_path else self.legal_config.models.agent_base
-        resolved_adapter_path = self.legal_config.resolve_project_path(adapter_path) if adapter_path else None
         registry = UnifiedToolRegistry(
             retriever,
             study_tool_executor=self.tool_executor,
@@ -386,13 +425,9 @@ class UnifiedLegalAgent:
             interactive=False,
             ask_user_handler=lambda _question, _field: None,
         )
-        model = _get_model_cached(
-            str(resolved_model_path.resolve()),
-            str(resolved_adapter_path.resolve()) if resolved_adapter_path else "",
-            model_device,
-            self.legal_config.inference.load_in_4bit,
-            self.legal_config.inference.compute_dtype,
-        )
+        model = self._load_runtime_model(model_path=model_path, adapter_path=adapter_path, model_device=model_device)
+        if self.config.turn_analysis_mode == "llm":
+            self.memory_manager.bind_reasoner(QwenMemoryReasoner(model))
         return LegalAgentEngine(
             model,
             registry,
@@ -408,11 +443,121 @@ class UnifiedLegalAgent:
         )
 
     def _session_history(self, user_id: str, session_id: str, *, max_turns: int = 8) -> list[tuple[str, str]]:
-        state = self.memory_manager.get_session_state(user_id, session_id)
         history: list[tuple[str, str]] = []
-        for turn in state.turns[-max_turns:]:
+        turns = self.memory_manager.store.load_session_turns(user_id, session_id, limit=max_turns)
+        for turn in turns:
             history.append((turn.user_message, turn.assistant_message))
         return history
+
+    def _ensure_memory_reasoner(
+        self,
+        *,
+        model_path: str | None,
+        adapter_path: str | None,
+        model_device: str,
+    ) -> None:
+        if self.config.turn_analysis_mode != "llm":
+            return
+        signature = self._runtime_model_signature(model_path=model_path, adapter_path=adapter_path, model_device=model_device)
+        if getattr(self, "_memory_reasoner_signature", None) == signature:
+            return
+        model = _get_model_cached(*signature)
+        self.memory_manager.bind_reasoner(QwenMemoryReasoner(model))
+        self._memory_reasoner_signature = signature
+
+    def _runtime_model_signature(
+        self,
+        *,
+        model_path: str | None,
+        adapter_path: str | None,
+        model_device: str,
+    ) -> tuple[str, str, str, bool, str]:
+        resolved_model_path = self.legal_config.resolve_project_path(model_path) if model_path else self.legal_config.models.agent_base
+        resolved_adapter_path = self.legal_config.resolve_project_path(adapter_path) if adapter_path else None
+        return (
+            str(resolved_model_path.resolve()),
+            str(resolved_adapter_path.resolve()) if resolved_adapter_path else "",
+            model_device,
+            self.legal_config.inference.load_in_4bit,
+            self.legal_config.inference.compute_dtype,
+        )
+
+    def _load_runtime_model(
+        self,
+        *,
+        model_path: str | None,
+        adapter_path: str | None,
+        model_device: str,
+    ) -> LocalQwenChatModel:
+        return _get_model_cached(*self._runtime_model_signature(model_path=model_path, adapter_path=adapter_path, model_device=model_device))
+
+    def _grade_subjective_exam(self, question: dict[str, object], user_answer: str) -> dict[str, object]:
+        reference_answer = str(question.get("reference_answer") or question.get("answer") or "").strip()
+        analysis = str(question.get("analysis") or "").strip()
+        max_score = int(question.get("score") or 20)
+        if not reference_answer and not analysis:
+            return {
+                "score": 0,
+                "feedback": "当前题目缺少参考答案，无法完成主观评分。",
+                "matched_points": [],
+                "missing_points": [],
+            }
+
+        model = self._load_runtime_model(model_path=None, adapter_path=None, model_device="auto")
+        prompt = (
+            "你是中国法考阅卷器。请依据参考答案与解析，对用户的作答进行主观评分。"
+            "只输出 JSON，不要输出任何额外说明。"
+            "JSON 格式固定为："
+            '{"score": 0, "feedback": "...", "matched_points": ["..."], "missing_points": ["..."]}。\n\n'
+            f"题目类型：{question.get('question_type') or 'short_answer'}\n"
+            f"题目：{question.get('question') or ''}\n"
+            f"满分：{max_score}\n"
+            f"参考答案：{reference_answer}\n"
+            f"解析：{analysis}\n"
+            f"参考法条：{question.get('references') or []}\n"
+            f"用户答案：{user_answer.strip()}"
+        )
+        output = model.generate(
+            [
+                {"role": "system", "content": "你是严格的 JSON 阅卷器。输出必须是合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            max_new_tokens=320,
+            temperature=0.0,
+            top_p=0.9,
+            top_k=20,
+            presence_penalty=1.0,
+            enable_thinking=False,
+        )
+        text = (output.content or output.raw_text).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                payload = json.loads(text[start : end + 1])
+                payload["score"] = max(0, min(max_score, int(round(float(payload.get("score") or 0)))))
+                payload["feedback"] = str(payload.get("feedback") or "").strip()
+                payload["matched_points"] = [str(item) for item in payload.get("matched_points", []) if str(item).strip()][:5]
+                payload["missing_points"] = [str(item) for item in payload.get("missing_points", []) if str(item).strip()][:5]
+                return payload
+            except Exception:
+                pass
+        return {
+            "score": 0,
+            "feedback": "主观评分结果解析失败，请回看参考答案与解析。",
+            "matched_points": [],
+            "missing_points": [truncate_text(reference_answer or analysis, 160)] if (reference_answer or analysis) else [],
+        }
+
+    def prepare_context(
+        self,
+        question: str,
+        *,
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+    ) -> dict[str, Any]:
+        self._ensure_user_session(user_id, session_id)
+        return self.memory_manager.prepare_turn_context_payload(question, user_id, session_id)
 
     def _normalize_runtime_question(self, question: str, *, user_id: str, session_id: str) -> str:
         raw_question = str(question or "").strip()
@@ -427,9 +572,12 @@ class UnifiedLegalAgent:
         return raw_question
 
     def _looks_like_answer_sheet(self, text: str) -> bool:
-        matches = ANSWER_LINE_RE.findall(text)
+        matches = list(NUMBERED_ANSWER_BLOCK_RE.finditer(text))
         compact = " ".join(str(text or "").split())
-        return len(matches) >= 2 or bool(matches and len(compact) <= 48)
+        if len(matches) >= 1:
+            return True
+        inline_matches = INLINE_CHOICE_ANSWER_RE.findall(text)
+        return len(inline_matches) >= 2 or bool(inline_matches and len(compact) <= 48)
 
     def _looks_like_smalltalk(self, text: str) -> bool:
         normalized = str(text or "").strip().lower()
@@ -474,6 +622,8 @@ class UnifiedLegalAgent:
             return "mock_exam_generate"
         if "generate_report" in tool_names:
             return "report_generation"
+        if any(name in tool_names for name in ["rag_search", "retrieve_from_kb", "lookup_statute", "resolve_hierarchy"]):
+            return "legal_qa"
         if "profile_upsert" in tool_names:
             return "profile_update"
         if "profile_view" in tool_names:
@@ -526,6 +676,45 @@ class UnifiedLegalAgent:
         retrieval_device: str,
         prompt_mode: str,
         display_question: str | None,
+        model_path: str | None,
+        adapter_path: str | None,
+        model_device: str,
+    ) -> StudyAgentResponse:
+        response = self._compose_response(
+            question,
+            effective_question=effective_question,
+            result=result,
+            user_id=user_id,
+            session_id=session_id,
+            retrieval_device=retrieval_device,
+            prompt_mode=prompt_mode,
+            display_question=display_question,
+            model_path=model_path,
+            adapter_path=adapter_path,
+            model_device=model_device,
+        )
+        self._persist_response_turn(
+            user_id=user_id,
+            session_id=session_id,
+            user_message=display_question or question,
+            response=response,
+        )
+        return response
+
+    def _compose_response(
+        self,
+        question: str,
+        *,
+        effective_question: str,
+        result: AgentRunResult,
+        user_id: str,
+        session_id: str,
+        retrieval_device: str,
+        prompt_mode: str,
+        display_question: str | None,
+        model_path: str | None,
+        adapter_path: str | None,
+        model_device: str,
     ) -> StudyAgentResponse:
         tool_results = list(result.tool_history)
         used_direct_fallback = False
@@ -536,6 +725,9 @@ class UnifiedLegalAgent:
                 retrieval_device=retrieval_device,
                 user_id=user_id,
                 session_id=session_id,
+                model_path=model_path,
+                adapter_path=adapter_path,
+                model_device=model_device,
             )
             if fallback_payload is not None:
                 used_direct_fallback = True
@@ -549,6 +741,8 @@ class UnifiedLegalAgent:
         answer = self._postprocess_answer(result.final_answer, tool_results)
         if intent == "mock_exam_generate" and self._has_tool(tool_results, "generate_exam"):
             answer = self._render_exam_answer(tool_results)
+        if intent == "mock_exam_score" and self._has_tool(tool_results, "score_exam"):
+            answer = self._render_score_answer(tool_results)
         if report_markdown and intent == "report_generation":
             answer = answer or "已生成学习报告，内容和下载入口已同步到右侧面板。"
         if result.needs_user_input and result.clarification_question:
@@ -556,13 +750,6 @@ class UnifiedLegalAgent:
         elif intent != "mock_exam_generate" and (used_direct_fallback or "Final Answer:" in str(result.trace or "")):
             result.trace = self._sync_trace_final_answer(result.trace, answer)
 
-        self._record_turn(
-            user_id,
-            session_id,
-            display_question or question,
-            answer,
-            tool_results,
-        )
         return StudyAgentResponse(
             intent=intent,
             answer=answer,
@@ -580,6 +767,44 @@ class UnifiedLegalAgent:
             clarification_question=result.clarification_question,
         )
 
+    def _persist_response_turn(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        user_message: str,
+        response: StudyAgentResponse,
+    ) -> None:
+        self._record_turn(
+            user_id,
+            session_id,
+            user_message,
+            response.answer,
+            response.tool_results,
+            reasoning_trace=response.trace,
+        )
+
+    def _persist_response_turn_async(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        user_message: str,
+        response: StudyAgentResponse,
+    ) -> None:
+        def _runner() -> None:
+            try:
+                self._persist_response_turn(
+                    user_id=user_id,
+                    session_id=session_id,
+                    user_message=user_message,
+                    response=response,
+                )
+            except Exception:
+                LOGGER.exception("流式答复的后台记忆写回失败")
+
+        threading.Thread(target=_runner, daemon=True).start()
+
     def _report_chat_answer(self, report_markdown: str | None) -> str:
         content = str(report_markdown or "").strip()
         if content:
@@ -587,13 +812,7 @@ class UnifiedLegalAgent:
         return "已生成学习报告，内容和下载入口已同步到右侧面板。"
 
     def _replace_last_turn_answer(self, user_id: str, session_id: str, answer: str) -> None:
-        session = self.memory_manager.store.load_session_state(user_id, session_id)
-        if not session.turns:
-            return
-        session.turns[-1].assistant_message = answer
-        session.summary = self.memory_manager._summarize_session(session)
-        session.updated_at = utcnow_iso()
-        self.memory_manager.store.save_session_state(session)
+        self.memory_manager.replace_last_turn_answer(user_id, session_id, answer)
 
     def _record_turn(
         self,
@@ -602,6 +821,7 @@ class UnifiedLegalAgent:
         user_message: str,
         answer: str,
         tool_results: list[dict[str, Any]],
+        reasoning_trace: str | None = None,
     ) -> None:
         self.memory_manager.record_turn(
             user_id,
@@ -609,6 +829,7 @@ class UnifiedLegalAgent:
             user_message,
             answer,
             tool_trace=tool_results,
+            reasoning_trace=reasoning_trace,
         )
         self.memory_manager.decay_memories(user_id)
 
@@ -620,28 +841,41 @@ class UnifiedLegalAgent:
         retrieval_device: str,
         user_id: str,
         session_id: str,
+        model_path: str | None,
+        adapter_path: str | None,
+        model_device: str,
     ) -> dict[str, Any] | None:
-        profile_updates = self.memory_manager.extract_profile_updates(question)
-        if profile_updates:
-            return self._build_direct_profile_update_payload(question, profile_updates, user_id=user_id, session_id=session_id)
         if self._looks_like_answer_sheet(question) and self.memory_manager.load_active_exam(user_id, session_id):
             return self._build_direct_score_payload(question, user_id=user_id, session_id=session_id)
+        profile_updates = self.memory_manager.extract_profile_updates_for_user(question, user_id=user_id, session_id=session_id)
+        profile_update_steps = self._profile_update_steps(question, profile_updates, user_id=user_id, session_id=session_id)
         if self._looks_like_report_request(question):
-            return self._build_direct_report_payload(user_id=user_id, session_id=session_id, report_type=self._infer_report_type(question))
+            return self._build_direct_report_payload(
+                user_id=user_id,
+                session_id=session_id,
+                report_type=self._infer_report_type(question),
+                profile_update_steps=profile_update_steps,
+            )
         if self._looks_like_exam_request(question):
-            topic, question_count, exam_type = self._infer_exam_request(question)
+            topic, question_count, exam_type, question_types = self._infer_exam_request(question)
             return self._build_direct_exam_payload(
                 user_id=user_id,
                 session_id=session_id,
                 topic=topic,
                 question_count=question_count,
                 exam_type=exam_type,
+                question_types=question_types,
+                profile_update_steps=profile_update_steps,
             )
         return self._build_direct_qa_payload(
             effective_question,
             retrieval_device=retrieval_device,
             user_id=user_id,
             session_id=session_id,
+            profile_update_steps=profile_update_steps,
+            model_path=model_path,
+            adapter_path=adapter_path,
+            model_device=model_device,
         )
 
     def _sync_trace_final_answer(self, trace: str | None, answer: str) -> str:
@@ -766,7 +1000,7 @@ class UnifiedLegalAgent:
             return "mock_exam_review"
         return "study_progress"
 
-    def _infer_exam_request(self, question: str) -> tuple[str, int, str]:
+    def _infer_exam_request(self, question: str) -> tuple[str, int, str, list[str]]:
         compact = str(question or "").strip()
         topic = "综合"
         for candidate in ["民法", "刑法", "行政法", "刑诉", "民诉", "理论法", "商经法"]:
@@ -782,7 +1016,14 @@ class UnifiedLegalAgent:
             exam_type = "章节练习"
         elif "真题" in compact:
             exam_type = "真题模拟"
-        return topic, question_count, exam_type
+        question_types = ["single_choice"]
+        if any(marker in compact for marker in ["简答", "主观", "问答"]):
+            question_types = ["short_answer"]
+        elif any(marker in compact for marker in ["案例", "案例分析"]):
+            question_types = ["case_analysis"]
+        elif any(marker in compact for marker in ["混合", "综合题型"]):
+            question_types = ["single_choice", "short_answer", "case_analysis"]
+        return topic, question_count, exam_type, question_types
 
     def _build_direct_profile_update_payload(
         self,
@@ -819,6 +1060,19 @@ class UnifiedLegalAgent:
         )
         return {"tool_results": tool_results, "answer": answer, "trace": "profile_upsert -> profile_view"}
 
+    def _profile_update_steps(
+        self,
+        question: str,
+        profile_updates: dict[str, Any],
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        if not profile_updates:
+            return []
+        payload = self._build_direct_profile_update_payload(question, profile_updates, user_id=user_id, session_id=session_id)
+        return list(payload.get("tool_results") or [])
+
     def _build_direct_score_payload(self, question: str, *, user_id: str, session_id: str) -> dict[str, Any]:
         tool_results = [
             {
@@ -844,13 +1098,154 @@ class UnifiedLegalAgent:
                 ),
             },
         ]
-        score_payload = dict(tool_results[0]["result"] or {})
-        answer = (
-            f"本次测试得分为 {score_payload.get('score_percent', 0)} 分。"
-            f" 暴露薄弱点：{'、'.join(score_payload.get('weak_tags') or []) or '暂无'}。"
-            " 学习反馈报告已同步到右侧面板。"
-        )
+        answer = self._render_score_answer(tool_results)
         return {"tool_results": tool_results, "answer": answer, "trace": "score_exam -> generate_report"}
+
+    def _prepare_context_step(self, query: str, *, user_id: str, session_id: str, reason: str) -> dict[str, Any]:
+        return {
+            "tool_name": "prepare_context",
+            "reason": reason,
+            "arguments": {"query": query},
+            "result": self.tool_executor.execute(
+                "prepare_context",
+                {"query": query},
+                user_id=user_id,
+                session_id=session_id,
+            ),
+        }
+
+    def _needs_rag_search(self, question: str, *, has_profile_update: bool) -> bool:
+        normalized = str(question or "").strip()
+        if not normalized:
+            return False
+        if normalized.endswith(("?", "？")):
+            return True
+        query_markers = (
+            "怎么",
+            "如何",
+            "为什么",
+            "怎么办",
+            "能否",
+            "是否",
+            "解释",
+            "分析",
+            "区别",
+            "法条",
+            "依据",
+            "案例",
+            "知识点",
+        )
+        if any(marker in normalized for marker in query_markers):
+            return True
+        if has_profile_update:
+            return False
+        return True
+
+    def _render_profile_update_ack(self, tool_results: list[dict[str, Any]]) -> str:
+        result_by_name = {entry["tool_name"]: entry["result"] for entry in tool_results}
+        profile = dict(result_by_name.get("profile_view", {}).get("profile") or {})
+        parts = ["记住了。"]
+        goals = list(profile.get("study_goals") or [])
+        weak_points = list(profile.get("weak_points") or [])
+        preferences = dict(profile.get("preferences") or {})
+        if goals:
+            parts.append(f"当前我会按你主要复习 {'、'.join(goals[:4])} 来组织后续辅导。")
+        if weak_points:
+            parts.append(f"我也会把 {'、'.join(weak_points[:4])} 视为优先复盘的薄弱点。")
+        response_length = str(preferences.get("response_length") or "").strip()
+        if response_length:
+            parts.append(f"后续答复我会尽量控制在{response_length}一点的风格。")
+        if len(parts) == 1:
+            parts.append("后续我会按这些长期信息调整回答、出题和复盘重点。")
+        return "".join(parts)
+
+    def _compact_tool_results_for_prompt(self, tool_results: list[dict[str, Any]]) -> str:
+        sections: list[str] = []
+        for index, entry in enumerate(tool_results[-6:], start=1):
+            tool_name = str(entry.get("tool_name") or "unknown_tool")
+            reason = str(entry.get("reason") or "")
+            arguments = json.dumps(entry.get("arguments") or {}, ensure_ascii=False, sort_keys=True)
+            result_text = observation_to_text(dict(entry.get("result") or {}))
+            sections.append(
+                f"步骤{index} 工具：{tool_name}\n原因：{reason}\n参数：{arguments}\n结果：\n{result_text}"
+            )
+        return truncate_text("\n\n".join(sections), 3600)
+
+    def _fallback_answer_from_tools(
+        self,
+        question: str,
+        tool_results: list[dict[str, Any]],
+        *,
+        hits: list[dict[str, Any]],
+        statute_results: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        statute_results = list(statute_results or [])
+        tool_names = {str(entry.get("tool_name") or "") for entry in tool_results}
+        if "rag_search" in tool_names or "retrieve_from_kb" in tool_names:
+            if hits or statute_results:
+                return self._render_direct_qa_answer(question, hits, statute_results=statute_results)
+            if self._looks_like_smalltalk(question):
+                return None
+            return "我已经结合当前上下文补做了检索，但这次还没有命中足够强相关的材料。你可以补充更具体的争点、法条名称、题型或事实背景，我再继续分析。"
+        if "profile_upsert" in tool_names:
+            return self._render_profile_update_ack(tool_results)
+        return None
+
+    def _synthesize_tool_based_answer(
+        self,
+        question: str,
+        tool_results: list[dict[str, Any]],
+        *,
+        model_path: str | None,
+        adapter_path: str | None,
+        model_device: str,
+        fallback_answer: str | None,
+    ) -> str | None:
+        if not tool_results:
+            return fallback_answer
+        try:
+            model = self._load_runtime_model(model_path=model_path, adapter_path=adapter_path, model_device=model_device)
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是法律学习 Agent 的最终答复整合器。现在不能再调用任何工具。"
+                        "你必须只基于最新用户输入与已经执行完毕的工具结果来写最终中文答复。"
+                        "先正面回应用户这一轮真正的需求，不要把回复固定成“已更新档案”之类模板。"
+                        "如果本轮顺便更新了画像，要自然说明你记住了哪些长期信息，并继续回应用户当前问题。"
+                        "如果检索结果不足，就明确说明不足，并指出还需要什么信息或下一步可以做什么。"
+                        "不要编造工具结果中没有出现的法条、事实、分数或结论。"
+                        "不要输出 Thought、Action、Observation 或 Final Answer 标签。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"最新用户输入：\n{question}\n\n"
+                        f"已执行的工具结果：\n{self._compact_tool_results_for_prompt(tool_results)}\n\n"
+                        f"如果工具结果不足时的保底答复：\n{fallback_answer or '无'}\n\n"
+                        "请直接输出最终答复。"
+                    ),
+                },
+            ]
+            output = model.generate(
+                messages,
+                max_new_tokens=min(self.legal_config.inference.max_new_tokens, 320),
+                temperature=0.0,
+                top_p=1.0,
+                top_k=self.legal_config.inference.top_k,
+                presence_penalty=1.0,
+                enable_thinking=False,
+            )
+            answer_text = str(output.content or output.raw_text or "").strip()
+            parsed = parse_react_output(answer_text)
+            if parsed.kind == "final" and parsed.final_answer:
+                answer_text = parsed.final_answer.strip()
+            else:
+                answer_text = answer_text.replace("Final Answer:", "").strip()
+            return answer_text or fallback_answer
+        except Exception:
+            return fallback_answer
 
     def _build_direct_exam_payload(
         self,
@@ -860,50 +1255,56 @@ class UnifiedLegalAgent:
         topic: str,
         question_count: int,
         exam_type: str,
+        question_types: list[str] | None = None,
+        profile_update_steps: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        tool_results = [
-            {
-                "tool_name": "profile_view",
-                "reason": "先读取当前画像，用于确定选题偏好。",
-                "arguments": {},
-                "result": self.tool_executor.execute("profile_view", {}, user_id=user_id, session_id=session_id),
-            },
-            {
-                "tool_name": "memory_search",
-                "reason": "读取近期会话与薄弱点，辅助出题。",
-                "arguments": {"query": topic, "top_k": 6},
-                "result": self.tool_executor.execute("memory_search", {"query": topic, "top_k": 6}, user_id=user_id, session_id=session_id),
-            },
+        tool_results = list(profile_update_steps or [])
+        if not any(str(entry.get("tool_name") or "") == "profile_view" for entry in tool_results):
+            tool_results.append(
+                {
+                    "tool_name": "profile_view",
+                    "reason": "先读取当前画像，用于确定选题偏好。",
+                    "arguments": {},
+                    "result": self.tool_executor.execute("profile_view", {}, user_id=user_id, session_id=session_id),
+                }
+            )
+        tool_results.append(self._prepare_context_step(topic, user_id=user_id, session_id=session_id, reason="读取长期画像与当前会话摘要，辅助出题。"))
+        tool_results.append(
             {
                 "tool_name": "generate_exam",
                 "reason": "依据画像与题型偏好生成模拟题。",
-                "arguments": {"topic": topic, "question_count": question_count, "exam_type": exam_type},
+                "arguments": {"topic": topic, "question_count": question_count, "exam_type": exam_type, "question_types": question_types or ["single_choice"]},
                 "result": self.tool_executor.execute(
                     "generate_exam",
-                    {"topic": topic, "question_count": question_count, "exam_type": exam_type},
+                    {"topic": topic, "question_count": question_count, "exam_type": exam_type, "question_types": question_types or ["single_choice"]},
                     user_id=user_id,
                     session_id=session_id,
                 ),
-            },
-        ]
-        return {"tool_results": tool_results, "answer": self._render_exam_answer(tool_results), "trace": "profile_view -> memory_search -> generate_exam"}
+            }
+        )
+        trace = " -> ".join(str(entry.get("tool_name") or "") for entry in tool_results)
+        return {"tool_results": tool_results, "answer": self._render_exam_answer(tool_results), "trace": trace}
 
-    def _build_direct_report_payload(self, *, user_id: str, session_id: str, report_type: str) -> dict[str, Any]:
-        tool_results = [
-            {
-                "tool_name": "memory_search",
-                "reason": "先读取近期会话、画像与测试信息。",
-                "arguments": {"query": report_type, "top_k": 8},
-                "result": self.tool_executor.execute("memory_search", {"query": report_type, "top_k": 8}, user_id=user_id, session_id=session_id),
-            },
+    def _build_direct_report_payload(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        report_type: str,
+        profile_update_steps: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        tool_results = list(profile_update_steps or [])
+        tool_results.append(self._prepare_context_step(report_type, user_id=user_id, session_id=session_id, reason="先读取近期会话、画像与测试信息。"))
+        tool_results.append(
             {
                 "tool_name": "generate_report",
                 "reason": "生成会话级学习报告。",
                 "arguments": {"report_type": report_type},
                 "result": self.tool_executor.execute("generate_report", {"report_type": report_type}, user_id=user_id, session_id=session_id),
-            },
-        ]
-        return {"tool_results": tool_results, "answer": "已生成学习报告，内容和下载入口已同步到右侧面板。", "trace": "memory_search -> generate_report"}
+            }
+        )
+        trace = " -> ".join(str(entry.get("tool_name") or "") for entry in tool_results)
+        return {"tool_results": tool_results, "answer": "已生成学习报告，内容和下载入口已同步到右侧面板。", "trace": trace}
 
     def _build_direct_qa_payload(
         self,
@@ -912,35 +1313,45 @@ class UnifiedLegalAgent:
         retrieval_device: str,
         user_id: str,
         session_id: str,
+        profile_update_steps: list[dict[str, Any]] | None,
+        model_path: str | None,
+        adapter_path: str | None,
+        model_device: str,
     ) -> dict[str, Any] | None:
-        memory_result = self.tool_executor.execute(
-            "memory_search",
-            {"query": question, "top_k": 6},
+        tool_results = list(profile_update_steps or [])
+        context_result = self.tool_executor.execute(
+            "prepare_context",
+            {"query": question},
             user_id=user_id,
             session_id=session_id,
         )
-        rag_result = self.tool_executor.execute(
-            "rag_search",
-            {"query": question, "top_k": self.config.retrieval_top_k},
-            user_id=user_id,
-            session_id=session_id,
+        tool_results.append(
+            {
+                "tool_name": "prepare_context",
+                "reason": "先读取用户画像、长期记忆与近期会话上下文。",
+                "arguments": {"query": question},
+                "result": context_result,
+            }
         )
-        tool_results = [
-            {
-                "tool_name": "memory_search",
-                "reason": "先读取用户画像与近期会话上下文。",
-                "arguments": {"query": question, "top_k": 6},
-                "result": memory_result,
-            },
-            {
-                "tool_name": "rag_search",
-                "reason": "综合检索法规、题库、案例和学习常识。",
-                "arguments": {"query": question, "top_k": self.config.retrieval_top_k},
-                "result": rag_result,
-            },
-        ]
+        run_rag = self._needs_rag_search(question, has_profile_update=bool(profile_update_steps))
+        rag_result: dict[str, Any] = {"results": []}
+        if run_rag:
+            rag_result = self.tool_executor.execute(
+                "rag_search",
+                {"query": question, "top_k": self.config.retrieval_top_k},
+                user_id=user_id,
+                session_id=session_id,
+            )
+            tool_results.append(
+                {
+                    "tool_name": "rag_search",
+                    "reason": "综合检索法规、题库、案例和学习常识。",
+                    "arguments": {"query": question, "top_k": self.config.retrieval_top_k},
+                    "result": rag_result,
+                }
+            )
         statute_payload = None
-        if self.config.use_legacy_statute_rag and self.config.legacy_config_path is not None:
+        if run_rag and self.config.use_legacy_statute_rag and self.config.legacy_config_path is not None:
             retriever = _get_retriever_cached(self.legal_config_path, retrieval_device)
             statute_payload = UnifiedToolRegistry(
                 retriever,
@@ -957,15 +1368,23 @@ class UnifiedLegalAgent:
                     "result": statute_payload,
                 }
             )
-        hits = self._select_relevant_knowledge_hits(question, list(rag_result.get("results") or []))
+        hits = self._select_relevant_knowledge_hits(question, list(rag_result.get("results") or [])) if run_rag else []
         statute_results = self._select_relevant_statute_results(question, statute_payload)
-        if not hits and not statute_results:
-            answer = None if self._looks_like_smalltalk(question) else "我已经补做了检索，但这次没有命中足够强相关的材料。建议你补充更具体的争点、法条名称、题型或事实背景后再问我。"
-        else:
-            answer = self._render_direct_qa_answer(question, hits, statute_results=statute_results)
-        trace = "memory_search -> rag_search"
-        if statute_payload is not None:
-            trace += " -> retrieve_from_kb"
+        fallback_answer = self._fallback_answer_from_tools(question, tool_results, hits=hits, statute_results=statute_results)
+        answer = fallback_answer
+        should_synthesize = bool(profile_update_steps) or (
+            run_rag and not (self._looks_like_smalltalk(question) and not hits and not statute_results)
+        )
+        if should_synthesize:
+            answer = self._synthesize_tool_based_answer(
+                question,
+                tool_results,
+                model_path=model_path,
+                adapter_path=adapter_path,
+                model_device=model_device,
+                fallback_answer=fallback_answer,
+            )
+        trace = " -> ".join(str(entry.get("tool_name") or "") for entry in tool_results)
         return {"tool_results": tool_results, "answer": answer, "trace": trace}
 
     def _render_direct_qa_answer(
@@ -1015,46 +1434,33 @@ class UnifiedLegalAgent:
         topic: str,
         question_count: int,
         exam_type: str,
+        question_types: list[str] | None = None,
     ) -> StudyAgentResponse:
-        tool_results = [
-            {
-                "tool_name": "profile_view",
-                "reason": "先读取当前画像，用于确定选题偏好。",
-                "arguments": {},
-                "result": self.tool_executor.execute("profile_view", {}, user_id=user_id, session_id=session_id),
-            },
-            {
-                "tool_name": "memory_search",
-                "reason": "读取近期会话与薄弱点，辅助出题。",
-                "arguments": {"query": topic, "top_k": 6},
-                "result": self.tool_executor.execute("memory_search", {"query": topic, "top_k": 6}, user_id=user_id, session_id=session_id),
-            },
-            {
-                "tool_name": "generate_exam",
-                "reason": "依据画像与题型偏好生成模拟题。",
-                "arguments": {"topic": topic, "question_count": question_count, "exam_type": exam_type},
-                "result": self.tool_executor.execute(
-                    "generate_exam",
-                    {"topic": topic, "question_count": question_count, "exam_type": exam_type},
-                    user_id=user_id,
-                    session_id=session_id,
-                ),
-            },
-        ]
-        answer = self._render_exam_answer(tool_results)
+        payload = self._build_direct_exam_payload(
+            user_id=user_id,
+            session_id=session_id,
+            topic=topic,
+            question_count=question_count,
+            exam_type=exam_type,
+            question_types=question_types,
+        )
+        tool_results = payload["tool_results"]
+        answer = payload["answer"]
+        trace = self._render_exam_trace(tool_results, answer)
         self._record_turn(
             user_id,
             session_id,
-            f"[UI操作] 生成模拟测试 exam_type={exam_type} topic={topic} question_count={question_count}",
+            f"[UI操作] 生成模拟测试 exam_type={exam_type} topic={topic} question_count={question_count} question_types={','.join(question_types or ['single_choice'])}",
             answer,
             tool_results,
+            reasoning_trace=trace,
         )
         return StudyAgentResponse(
             intent="mock_exam_generate",
             answer=answer,
             plan={"planner_backend": "direct_tool", "tool_names": [entry["tool_name"] for entry in tool_results]},
             tool_results=tool_results,
-            trace=self._render_exam_trace(tool_results, answer),
+            trace=trace,
         )
 
     def _direct_generate_report_response(
@@ -1065,12 +1471,7 @@ class UnifiedLegalAgent:
         report_type: str,
     ) -> StudyAgentResponse:
         tool_results = [
-            {
-                "tool_name": "memory_search",
-                "reason": "先读取近期会话、画像与测试信息。",
-                "arguments": {"query": report_type, "top_k": 8},
-                "result": self.tool_executor.execute("memory_search", {"query": report_type, "top_k": 8}, user_id=user_id, session_id=session_id),
-            },
+            self._prepare_context_step(report_type, user_id=user_id, session_id=session_id, reason="先读取近期会话、画像与测试信息。"),
             {
                 "tool_name": "generate_report",
                 "reason": "生成会话级学习报告。",
@@ -1080,12 +1481,14 @@ class UnifiedLegalAgent:
         ]
         report_path, report_markdown = self._extract_report_artifacts(tool_results)
         answer = self._report_chat_answer(report_markdown)
+        trace = " -> ".join(str(entry.get("tool_name") or "") for entry in tool_results)
         self._record_turn(
             user_id,
             session_id,
             f"[UI操作] 生成学习报告 report_type={report_type}",
             answer,
             tool_results,
+            reasoning_trace=trace,
         )
         return StudyAgentResponse(
             intent="report_generation",
@@ -1094,7 +1497,7 @@ class UnifiedLegalAgent:
             tool_results=tool_results,
             report_path=report_path,
             report_markdown=report_markdown,
-            trace="",
+            trace=trace,
         )
 
     def _render_profile_answer(self, tool_results: list[dict[str, Any]]) -> str:
@@ -1112,21 +1515,88 @@ class UnifiedLegalAgent:
         exam_payload = dict(result_by_name.get("generate_exam") or {})
         profile = dict(result_by_name.get("profile_view", {}).get("profile") or {})
         profile_tags = list(dict.fromkeys([*(profile.get("weak_points") or []), *(profile.get("study_goals") or [])]))
+        selection_notes = [str(note).strip() for note in exam_payload.get("selection_notes", []) if str(note).strip()]
+        question_types = [str(item) for item in exam_payload.get("question_types", []) if str(item).strip()]
+        if question_types == ["single_choice"]:
+            answer_instruction = "请按“1.A 2.B 3.C”这样的格式直接回复答案，我会统一评分、记录并生成复盘。"
+        else:
+            answer_instruction = "请按编号逐题作答。选择题可写成“1.A”，简答或案例题请写成“2. 你的答案”。我会统一评分、记录并生成复盘。"
         lines = [
             "以下是为当前用户生成的法考模拟测试题目：",
             f"主题：{exam_payload.get('topic', '综合')}，题型：{exam_payload.get('exam_type', '综合练习')}，共 {exam_payload.get('question_count', 0)} 题。",
-            f"本次选题优先参考的画像标签：{'、'.join(profile_tags[:5]) or '当前画像为空，已按综合模式出题'}。",
+            f"本次选题优先参考的画像标签：{'、'.join(profile_tags[:5]) or '当前画像暂无额外选题标签，已按当前题型与主题要求出题'}。",
             f"本轮已随机回放错题库 {exam_payload.get('reused_wrong_question_count', 0)} 题。",
-            "请按“1.A 2.B 3.C”这样的格式直接回复答案，我会统一评分、记录并生成复盘。",
+            *selection_notes,
+            answer_instruction,
             "",
         ]
         for question in exam_payload.get("questions", []):
-            lines.append(f"{question['index']}. {question['question']}")
+            question_type = str(question.get("question_type") or "single_choice")
+            type_label = {
+                "single_choice": "单选题",
+                "short_answer": "简答题",
+                "case_analysis": "案例分析题",
+            }.get(question_type, question_type)
+            lines.append(f"{question['index']}. [{type_label}] {question['question']}")
             for option_key, option_value in (question.get("options") or {}).items():
                 lines.append(f"   {option_key}. {option_value}")
             lines.append("")
         while lines and not lines[-1].strip():
             lines.pop()
+        return "\n".join(lines)
+
+    def _render_score_answer(self, tool_results: list[dict[str, Any]]) -> str:
+        result_by_name = {entry["tool_name"]: entry["result"] for entry in tool_results}
+        score_payload = dict(result_by_name.get("score_exam") or {})
+        report_payload = dict(result_by_name.get("generate_report") or {})
+        score_percent = score_payload.get("score_percent", 0)
+        earned_score = score_payload.get("earned_score", 0)
+        total_score = score_payload.get("total_score", 0)
+        wrong_questions = list(score_payload.get("wrong_questions") or [])
+        weak_tags = list(score_payload.get("weak_tags") or [])
+        strong_tags = list(score_payload.get("strong_tags") or [])
+
+        lines = [f"本次测试得分：{score_percent} 分（{earned_score}/{total_score}）。"]
+        if wrong_questions:
+            lines.append(f"本轮主要薄弱点：{'、'.join(weak_tags[:6]) or '待继续复盘'}。")
+            lines.append("以下是需要重点复盘的题目：")
+            for question in wrong_questions[:5]:
+                index = question.get("index")
+                user_answer = question.get("user_answer") or "未作答"
+                correct_answer = question.get("correct_answer") or "未提供"
+                question_type = str(question.get("question_type") or "single_choice")
+                options = dict(question.get("options") or {})
+                correct_option_text = str(options.get(correct_answer) or "").strip()
+                title = f"第{index}题" if index else "错题"
+                if question_type == "single_choice":
+                    lines.append(f"{title}：你的答案是 {user_answer}，正确答案是 {correct_answer}。")
+                    if correct_option_text:
+                        lines.append(f"正确选项内容：{correct_option_text}")
+                else:
+                    lines.append(
+                        f"{title}：你得了 {question.get('earned_score', 0)}/{question.get('max_score', 20)} 分。"
+                    )
+                    lines.append(f"你的作答：{truncate_text(str(user_answer), 140)}")
+                    if correct_answer:
+                        lines.append(f"参考答案：{truncate_text(str(correct_answer), 200)}")
+                    feedback = str(question.get("grading_feedback") or "").strip()
+                    if feedback:
+                        lines.append(f"评价：{feedback}")
+                    missing_points = [str(item) for item in question.get("missing_points", []) if str(item).strip()]
+                    if missing_points:
+                        lines.append(f"欠缺要点：{'；'.join(missing_points[:3])}")
+                analysis = str(question.get("analysis") or "").strip()
+                if analysis:
+                    lines.append(f"解释：{truncate_text(analysis, 220)}")
+                prompt = str(question.get("question") or "").strip()
+                if prompt:
+                    lines.append(f"题干：{truncate_text(prompt, 120)}")
+        else:
+            lines.append("本轮没有错题，说明这套题目前掌握得比较稳。")
+            if strong_tags:
+                lines.append(f"本轮表现较稳的知识点：{'、'.join(strong_tags[:6])}。")
+        if str(report_payload.get("report_path") or "").strip():
+            lines.append("学习反馈报告已同步到右侧面板，并写入报告目录。")
         return "\n".join(lines)
 
     def _render_exam_trace(self, tool_results: list[dict[str, Any]], answer: str) -> str:
