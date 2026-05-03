@@ -1,0 +1,53 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]
+Loading weights:  15%|█▌        | 60/398 [00:00<00:00, 595.01it/s]
+Loading weights:  30%|███       | 121/398 [00:00<00:00, 575.49it/s]
+Loading weights:  48%|████▊     | 190/398 [00:00<00:00, 600.55it/s]
+Loading weights:  65%|██████▍   | 257/398 [00:00<00:00, 626.19it/s]
+Loading weights:  81%|████████  | 322/398 [00:00<00:00, 634.40it/s]
+Loading weights:  99%|█████████▊| 393/398 [00:00<00:00, 653.75it/s]
+Loading weights: 100%|██████████| 398/398 [00:00<00:00, 639.75it/s]
+
+Loading weights:   0%|          | 0/201 [00:00<?, ?it/s]
+Loading weights: 100%|██████████| 201/201 [00:00<00:00, 6911.53it/s]
+/opt/anaconda3/envs/agent_env/lib/python3.11/site-packages/jieba/_compat.py:18: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+Building prefix dict from the default dictionary ...
+Loading model from cache /var/folders/h7/7qktz4vn5_s10nh29qw2f8z40000gn/T/jieba.cache
+Loading model cost 0.263 seconds.
+Prefix dict has been built successfully.
+
+Loading Qwen3-4B embeddings...
+Loading BGE reranker...
+                  RAG Evolution Comparison: 关于非法集资的判例                  
+┏━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┓
+┃ Rank ┃ Lexical (Old)    ┃ Embedding (Qwen) ┃ Reranked (BGE)   ┃ Rerank Score ┃
+┡━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━┩
+│  1   │ 非法集资所得款 … │ 刑法案例：非法 … │ 目前对xx集团正 … │       1.0603 │
+│  2   │ 目前对xx集团正 … │ 非法集资所得款 … │ 刑法案例：请根 … │      -0.4542 │
+│      │                  │                  │ 破坏性采矿罪     │              │
+│  3   │ 刑法案例：非法 … │ 基于下列案件， … │ 非法集资所得款 … │      -1.5502 │
+└──────┴──────────────────┴──────────────────┴──────────────────┴──────────────┘
+                 RAG Evolution Comparison: 租赁合同纠纷怎么处理                 
+┏━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┓
+┃ Rank ┃ Lexical (Old)    ┃ Embedding (Qwen) ┃ Reranked (BGE)   ┃ Rerank Score ┃
+┡━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━┩
+│  1   │ 对评估报告不服 … │ 民诉案例：本案 … │ 根据以上案例， … │      -1.1411 │
+│  2   │ 拖欠工资怎么处理 │ 5000元收条复印 … │ 被告公司是否发 … │      -1.9485 │
+│      │                  │ 根据案件背景， … │                  │              │
+│  3   │ 某工厂工人发现 … │ 本案是否提交了 … │ 5000元收条复印 … │      -2.4934 │
+│      │                  │                  │ 根据案件背景， … │              │
+└──────┴──────────────────┴──────────────────┴──────────────────┴──────────────┘
+                 RAG Evolution Comparison: 故意伤害罪的量刑标准                 
+┏━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┓
+┃ Rank ┃ Lexical (Old)    ┃ Embedding (Qwen) ┃ Reranked (BGE)   ┃ Rerank Score ┃
+┡━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━┩
+│  1   │ 请根据所给的具 … │ 根据案件信息， … │ 请根据法律三段 … │       0.9176 │
+│      │ 非国家工作人员 … │                  │                  │              │
+│  2   │ 在一次刑事审判 … │ 请根据法律三段 … │ 刑法案例：请根 … │       0.8532 │
+│      │                  │                  │ 破坏性采矿罪     │              │
+│  3   │ 请推断下列案件 … │ 刑诉案例：被告 … │ 请做出可能的判 … │      -0.2035 │
+│      │ 经审理查明，201… │                  │ 经审理查明：孟 … │              │
+└──────┴──────────────────┴──────────────────┴──────────────────┴──────────────┘
+
