@@ -1,0 +1,13 @@
+/artifacts/
+/ckpt/
+/data/
+/memory/
+/models/
+/outputs/
+/reports/
+__pycache__/
+*.pyc
+/.venv/
+/.vscode/
+/.tools/
+/.pytest_cache/

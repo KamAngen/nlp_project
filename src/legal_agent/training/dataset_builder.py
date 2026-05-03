@@ -291,7 +291,7 @@ def _build_local_study_seeds(study_config) -> list[TrajectorySeed]:
                 question=f"我在准备法考，请结合“{title}”给我一个简洁的复习建议。",
                 expected_answer=content,
                 source="study_common",
-                expected_tools=["memory_search", "rag_search"],
+                expected_tools=["prepare_context", "rag_search"],
                 query_for_retrieval=f"{title} {' '.join(tags)} {content}",
                 metadata={
                     "scenario": "study_method_qa",
@@ -310,7 +310,7 @@ def _build_local_study_seeds(study_config) -> list[TrajectorySeed]:
                 question=f"请结合案例“{row.get('title')}”讲清楚：{issue}",
                 expected_answer=holding,
                 source="study_case",
-                expected_tools=["memory_search", "rag_search"],
+                expected_tools=["prepare_context", "rag_search"],
                 query_for_retrieval=f"{row.get('title')} {issue} {' '.join(tags)}",
                 references=[f"《{title}》" for title in row.get("statutes", [])],
                 metadata={
@@ -334,7 +334,7 @@ def _build_local_study_seeds(study_config) -> list[TrajectorySeed]:
                 question=f"我在复习{topic}，请解释这道题为什么选{row.get('answer')}：{row.get('question')}",
                 expected_answer=analysis,
                 source="study_question",
-                expected_tools=["memory_search", "rag_search", "retrieve_from_kb"],
+                expected_tools=["prepare_context", "rag_search", "retrieve_from_kb"],
                 query_for_retrieval=f"{row.get('question')} {' '.join(tags)}",
                 metadata={
                     "scenario": "study_statute_qa",
@@ -348,7 +348,7 @@ def _build_local_study_seeds(study_config) -> list[TrajectorySeed]:
                 question=f"请按照我当前的薄弱点，给我出一套 {topic} 的两题模拟测试。",
                 expected_answer=f"已生成一套围绕 {topic} 的模拟测试。",
                 source="study_exam",
-                expected_tools=["profile_view", "memory_search", "generate_exam"],
+                expected_tools=["profile_view", "prepare_context", "generate_exam"],
                 query_for_retrieval=topic,
                 metadata={
                     "scenario": "mock_exam_generate",
@@ -368,7 +368,7 @@ def _build_local_study_seeds(study_config) -> list[TrajectorySeed]:
                 question="请根据我最近的学习情况生成一份学习进度报告。",
                 expected_answer="已生成一份学习进度报告，并概括当前画像、会话进展和最近一次测试。",
                 source="study_report",
-                expected_tools=["memory_search", "generate_report"],
+                expected_tools=["prepare_context", "generate_report"],
                 metadata={
                     "scenario": "report_generation",
                     "report_type": "study_progress",
@@ -380,7 +380,7 @@ def _build_local_study_seeds(study_config) -> list[TrajectorySeed]:
                 question="请给我出一份偏重薄弱点诊断的学习报告。",
                 expected_answer="已生成一份薄弱点诊断报告，强调最近会话和易错主题。",
                 source="study_report",
-                expected_tools=["memory_search", "generate_report"],
+                expected_tools=["prepare_context", "generate_report"],
                 metadata={
                     "scenario": "report_generation",
                     "report_type": "weakness_diagnosis",

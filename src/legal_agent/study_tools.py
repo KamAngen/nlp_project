@@ -5,15 +5,20 @@ from pathlib import Path
 import json
 import re
 from uuid import uuid4
+from typing import Callable
 
 from context_engine.manager import MemoryManager
 from legal_agent.agent.tools import SafeCalculator
+from legal_agent.evaluation.metrics import exact_match_score, token_f1
 from legal_agent.utils.io import ensure_dir, write_json
 from legal_agent.utils.text import truncate_text
 from rag_engine.service import KnowledgeService
 
 
-ANSWER_LINE_RE = re.compile(r"(?P<index>\d+)\s*[\.、:：-]?\s*(?P<answer>[A-Da-d])")
+INLINE_CHOICE_ANSWER_RE = re.compile(r"(?P<index>\d+)\s*[\.、:：-]?\s*(?P<answer>[A-Da-d])(?=(?:\s|$))")
+NUMBERED_ANSWER_BLOCK_RE = re.compile(
+    r"(?ms)^\s*(?P<index>\d+)\s*[\.、:：-]\s*(?P<answer>.*?)(?=^\s*\d+\s*[\.、:：-]|\Z)"
+)
 
 
 @dataclass(slots=True)
@@ -31,12 +36,32 @@ class StudyToolExecutor:
         knowledge_service: KnowledgeService,
         *,
         report_root: str | Path,
+        subjective_exam_grader: Callable[[dict[str, object], str], dict[str, object]] | None = None,
     ) -> None:
         self.memory_manager = memory_manager
         self.knowledge_service = knowledge_service
         self.report_root = ensure_dir(report_root)
         self.calculator = SafeCalculator()
+        self.subjective_exam_grader = subjective_exam_grader
         self.specs = {
+            "prepare_context": ToolSpec(
+                "prepare_context",
+                "汇总当前用户画像、会话摘要和相关历史命中，返回供 planning 直接消费的上下文。",
+                {"query": "str"},
+                {
+                    "planning_context": "str",
+                    "summary_blocks": "dict",
+                    "profile_hits": "list",
+                    "system_hits": "list",
+                    "working_hits": "list",
+                    "long_term_hits": "list",
+                    "session_hits": "list",
+                    "guaranteed_hits": "list",
+                    "related_hits": "list",
+                    "retrieval_meta": "dict",
+                    "maintenance": "dict",
+                },
+            ),
             "memory_search": ToolSpec(
                 "memory_search",
                 "检索用户画像、会话记忆和系统全局记忆。",
@@ -70,7 +95,7 @@ class StudyToolExecutor:
             "generate_exam": ToolSpec(
                 "generate_exam",
                 "从题库中抽取题目，生成一套模拟测试。",
-                {"topic": "str | null", "question_count": "int", "exam_type": "str | null"},
+                {"topic": "str | null", "question_count": "int", "exam_type": "str | null", "question_types": "list | null"},
                 {"exam_session_id": "str", "exam_type": "str", "questions": "list"},
             ),
             "score_exam": ToolSpec(
@@ -106,8 +131,9 @@ class StudyToolExecutor:
 
     def execute(self, tool_name: str, tool_args: dict[str, object], *, user_id: str, session_id: str) -> dict[str, object]:
         dispatch = {
+            "prepare_context": lambda: self._prepare_context(user_id, session_id, **tool_args),
             "memory_search": lambda: self._memory_search(user_id, session_id, **tool_args),
-            "profile_upsert": lambda: self._profile_upsert(user_id, **tool_args),
+            "profile_upsert": lambda: self._profile_upsert(user_id, session_id=session_id, **tool_args),
             "profile_view": lambda: self._profile_view(user_id),
             "rag_search": lambda: self._rag_search(**tool_args),
             "calculator": lambda: self._calculator(**tool_args),
@@ -120,30 +146,54 @@ class StudyToolExecutor:
             raise KeyError(f"Unsupported study tool: {tool_name}")
         return dispatch[tool_name]()
 
+    def _prepare_context(self, user_id: str, session_id: str, query: str) -> dict[str, object]:
+        payload = self.memory_manager.prepare_turn_context_payload(query, user_id, session_id)
+        return {
+            "planning_context": payload["planning_context"],
+            "summary_blocks": payload["summary_blocks"],
+            "profile_hits": payload["profile_hits"],
+            "system_hits": payload["system_hits"],
+            "working_hits": payload["working_hits"],
+            "long_term_hits": payload["long_term_hits"],
+            "session_hits": payload["session_hits"],
+            "guaranteed_hits": payload["guaranteed_hits"],
+            "related_hits": payload["related_hits"],
+            "retrieval_meta": payload["retrieval_meta"],
+            "maintenance": payload["maintenance"],
+        }
+
     def _memory_search(self, user_id: str, session_id: str, query: str, top_k: int = 6) -> dict[str, object]:
-        bundle = self.memory_manager.assemble_context(query, user_id, session_id)
+        payload = self._prepare_context(user_id, session_id, query)
         results = []
-        for layer in ("profile", "system", "working", "episodic", "semantic"):
-            for hit in bundle.layer_hits.get(layer, [])[:top_k]:
-                results.append(
-                    {
-                        "layer": layer,
-                        "text": hit.item.text,
-                        "score": round(hit.score, 4),
-                        "reasons": list(hit.reasons),
-                    }
-                )
-        return {"results": results[:top_k], "summary": bundle.summary_blocks["memory"]}
+        for hit in payload["related_hits"][:top_k]:
+            item = dict(hit.get("item") or {})
+            results.append(
+                {
+                    "layer": item.get("layer"),
+                    "text": item.get("text"),
+                    "score": round(float(hit.get("score") or 0.0), 4),
+                    "reasons": list(hit.get("reasons") or []),
+                }
+            )
+        return {
+            "results": results,
+            "summary": payload["summary_blocks"].get("memory", ""),
+            "session_summary": payload["summary_blocks"].get("session", ""),
+            "long_term_summary": payload["summary_blocks"].get("long_term", ""),
+            "planning_context": payload["planning_context"],
+            "maintenance": dict(payload["maintenance"]),
+        }
 
     def _profile_upsert(
         self,
         user_id: str,
         raw_text: str | None = None,
         updates: dict[str, object] | None = None,
+        session_id: str | None = None,
     ) -> dict[str, object]:
         normalized_updates = dict(updates or {})
         if raw_text:
-            extracted = self.memory_manager.extract_profile_updates(raw_text)
+            extracted = self.memory_manager.extract_profile_updates_for_user(raw_text, user_id=user_id, session_id=session_id)
             for key, value in extracted.items():
                 if key in normalized_updates and isinstance(normalized_updates[key], list) and isinstance(value, list):
                     normalized_updates[key] = normalized_updates[key] + value
@@ -181,6 +231,7 @@ class StudyToolExecutor:
         topic: str | None = None,
         question_count: int = 5,
         exam_type: str | None = None,
+        question_types: list[str] | None = None,
     ) -> dict[str, object]:
         profile = self.memory_manager.get_user_profile(user_id)
         preferred_tags = list(dict.fromkeys([*profile.weak_points, *profile.study_goals]))
@@ -195,9 +246,11 @@ class StudyToolExecutor:
             if str(record_id).strip()
         ]
         effective_exam_type = str(exam_type or "综合练习").strip() or "综合练习"
+        effective_question_types = [str(item) for item in (question_types or ["single_choice"]) if str(item).strip()]
         questions = self.knowledge_service.sample_questions(
             topic=topic,
             question_count=question_count,
+            question_types=effective_question_types,
             preferred_tags=preferred_tags,
             exam_type=effective_exam_type,
             avoid_question_ids=recent_question_ids,
@@ -207,28 +260,32 @@ class StudyToolExecutor:
         if not questions:
             raise ValueError("题库为空，无法生成模拟测试。")
 
+        exam_questions, selection_notes = self.knowledge_service.build_exam_questions(questions, requested_topic=topic)
+        if not exam_questions:
+            raise ValueError("当前题库中没有通过结构校验的可用试题，无法生成模拟测试。")
+
         reused_wrong_question_ids = [question.record_id for question in questions if question.record_id in wrong_question_bank]
+        if len(exam_questions) < question_count:
+            target_topic = str(topic or "综合").strip() or "综合"
+            selection_notes.append(
+                f"当前题库中与{target_topic}严格匹配且通过校验的题目不足 {question_count} 题，本次返回 {len(exam_questions)} 题，未使用跨主题题目凑数。"
+            )
         exam_payload = {
             "exam_session_id": f"exam-{uuid4().hex[:10]}",
             "topic": topic or "综合",
             "exam_type": effective_exam_type,
-            "question_count": len(questions),
+            "question_count": len(exam_questions),
+            "requested_question_count": int(question_count),
+            "question_types": effective_question_types,
             "preferred_tags": preferred_tags[:8],
             "reused_wrong_question_count": len(reused_wrong_question_ids),
+            "selection_notes": list(dict.fromkeys(selection_notes)),
             "questions": [
                 {
-                    "index": index,
-                    "record_id": question.record_id,
-                    "topic": str(question.metadata.get("topic") or topic or "综合"),
-                    "question": question.title,
-                    "options": question.metadata.get("options", {}),
-                    "answer": question.metadata.get("answer"),
-                    "analysis": question.metadata.get("analysis"),
-                    "tags": list(question.tags),
-                    "score": int(question.metadata.get("score", 20)),
-                    "from_wrong_question_bank": question.record_id in wrong_question_bank,
+                    **question,
+                    "from_wrong_question_bank": question["record_id"] in wrong_question_bank,
                 }
-                for index, question in enumerate(questions, start=1)
+                for question in exam_questions
             ],
         }
         self.memory_manager.record_exam_session(user_id, session_id, exam_payload)
@@ -264,12 +321,28 @@ class StudyToolExecutor:
             score = int(question.get("score", 20))
             total_score += score
             user_answer = answers.get(str(index))
-            correct_answer = str(question.get("answer") or "").upper()
-            is_correct = user_answer == correct_answer
+            question_type = str(question.get("question_type") or "single_choice")
             record_id = str(question.get("record_id") or "").strip()
             question_tags = [str(tag) for tag in question.get("tags", []) if str(tag).strip()]
+            if question_type == "single_choice":
+                correct_answer = str(question.get("answer") or "").upper()
+                normalized_user_answer = self._normalize_choice_answer(user_answer, dict(question.get("options") or {}))
+                is_correct = normalized_user_answer == correct_answer
+                earned = score if is_correct else 0
+                grading_feedback = ""
+                matched_points: list[str] = []
+                missing_points: list[str] = []
+            else:
+                grade = self._grade_subjective_answer(question, user_answer=user_answer or "")
+                correct_answer = str(question.get("reference_answer") or question.get("answer") or "").strip()
+                earned = max(0, min(score, int(round(float(grade.get("score") or 0)))))
+                is_correct = earned >= max(int(round(score * 0.75)), score - 2)
+                grading_feedback = str(grade.get("feedback") or "").strip()
+                matched_points = [str(item) for item in grade.get("matched_points", []) if str(item).strip()][:5]
+                missing_points = [str(item) for item in grade.get("missing_points", []) if str(item).strip()][:5]
+
+            earned_score += earned
             if is_correct:
-                earned_score += score
                 strong_tags.extend(question_tags)
                 if record_id and record_id in wrong_question_bank:
                     corrected_question_ids.append(record_id)
@@ -277,25 +350,38 @@ class StudyToolExecutor:
                 weak_tags.extend(question_tags)
                 wrong_questions.append(
                     {
+                        "index": index,
                         "record_id": record_id,
                         "topic": str(question.get("topic") or exam_payload.get("topic") or "综合"),
+                        "question_type": question_type,
                         "question": str(question.get("question") or ""),
+                        "options": dict(question.get("options") or {}),
                         "tags": question_tags,
                         "analysis": str(question.get("analysis") or ""),
                         "correct_answer": correct_answer,
                         "user_answer": user_answer,
+                        "earned_score": earned,
+                        "max_score": score,
+                        "grading_feedback": grading_feedback,
+                        "matched_points": matched_points,
+                        "missing_points": missing_points,
                         "exam_session_id": str(exam_payload.get("exam_session_id") or ""),
                     }
                 )
             details.append(
                 {
                     "index": index,
+                    "question_type": question_type,
                     "user_answer": user_answer,
                     "correct_answer": correct_answer,
                     "is_correct": is_correct,
-                    "score": score if is_correct else 0,
+                    "score": earned,
+                    "max_score": score,
                     "analysis": question.get("analysis"),
                     "question": question.get("question"),
+                    "grading_feedback": grading_feedback,
+                    "matched_points": matched_points,
+                    "missing_points": missing_points,
                 }
             )
 
@@ -339,9 +425,80 @@ class StudyToolExecutor:
 
     def _parse_answer_sheet(self, text: str) -> dict[str, str]:
         answers: dict[str, str] = {}
-        for match in ANSWER_LINE_RE.finditer(text):
+        normalized = str(text or "").strip()
+        if not normalized:
+            return answers
+        inline_matches = list(INLINE_CHOICE_ANSWER_RE.finditer(normalized))
+        if inline_matches and "\n" not in normalized:
+            for match in inline_matches:
+                answers[str(int(match.group("index")))] = match.group("answer").upper()
+            return answers
+        for match in NUMBERED_ANSWER_BLOCK_RE.finditer(normalized):
+            answer_text = str(match.group("answer") or "").strip()
+            if not answer_text:
+                continue
+            answers[str(int(match.group("index")))] = answer_text
+        if answers:
+            return answers
+        for match in inline_matches:
             answers[str(int(match.group("index")))] = match.group("answer").upper()
         return answers
+
+    def _normalize_choice_answer(self, answer: str | None, options: dict[str, str]) -> str:
+        value = str(answer or "").strip()
+        if not value:
+            return ""
+        upper = value.upper()
+        if upper in {"A", "B", "C", "D"}:
+            return upper
+        compact_value = "".join(value.split()).lower()
+        for label, option_text in options.items():
+            compact_option = "".join(str(option_text or "").split()).lower()
+            if compact_value and compact_value == compact_option:
+                return str(label).upper()
+        return upper[:1]
+
+    def _grade_subjective_answer(self, question: dict[str, object], *, user_answer: str) -> dict[str, object]:
+        if self.subjective_exam_grader is not None:
+            try:
+                graded = dict(self.subjective_exam_grader(question, user_answer) or {})
+                graded.setdefault("score", 0)
+                graded.setdefault("feedback", "")
+                graded.setdefault("matched_points", [])
+                graded.setdefault("missing_points", [])
+                return graded
+            except Exception:
+                pass
+        return self._fallback_subjective_grade(question, user_answer=user_answer)
+
+    def _fallback_subjective_grade(self, question: dict[str, object], *, user_answer: str) -> dict[str, object]:
+        reference_answer = str(question.get("reference_answer") or question.get("answer") or question.get("analysis") or "").strip()
+        max_score = int(question.get("score", 20))
+        if not user_answer.strip():
+            return {
+                "score": 0,
+                "feedback": "未检测到作答内容。",
+                "matched_points": [],
+                "missing_points": [truncate_text(reference_answer, 120)] if reference_answer else [],
+            }
+        exact = exact_match_score(user_answer, reference_answer)
+        overlap = token_f1(user_answer, reference_answer)
+        score_ratio = max(exact, overlap)
+        score = int(round(max_score * min(1.0, score_ratio)))
+        matched_points = [truncate_text(reference_answer, 120)] if score_ratio >= 0.55 and reference_answer else []
+        missing_points = [] if score_ratio >= 0.75 else ([truncate_text(reference_answer, 120)] if reference_answer else [])
+        if score_ratio >= 0.75:
+            feedback = "核心法律结论基本到位。"
+        elif score_ratio >= 0.45:
+            feedback = "答案抓到了部分要点，但关键法律依据或结论还不够完整。"
+        else:
+            feedback = "答案与参考答案偏差较大，需要回到标准结论重新梳理。"
+        return {
+            "score": score,
+            "feedback": feedback,
+            "matched_points": matched_points,
+            "missing_points": missing_points,
+        }
 
     def _render_report(self, snapshot: dict[str, object], *, report_type: str) -> str:
         profile = dict(snapshot.get("profile") or {})

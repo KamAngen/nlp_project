@@ -1,3 +1,34 @@
+Metadata-Version: 2.4
+Name: nlp-assignment-legal-agent
+Version: 0.1.0
+Summary: Collaborative Chinese legal study agent with memory, planning and multi-source RAG
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: accelerate>=1.2.1
+Requires-Dist: aspose-words>=26.3.0
+Requires-Dist: bitsandbytes>=0.45.5
+Requires-Dist: datasets>=3.0.0
+Requires-Dist: gradio>=5.25.0
+Requires-Dist: huggingface_hub>=0.28.0
+Requires-Dist: jieba>=0.42.1
+Requires-Dist: jionlp>=1.5.27
+Requires-Dist: langgraph>=0.2.60
+Requires-Dist: networkx>=3.2
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: openpyxl>=3.1.2
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: peft>=0.14.0
+Requires-Dist: PyYAML>=6.0.1
+Requires-Dist: kaggle>=1.6.17
+Requires-Dist: rank-bm25>=0.2.2
+Requires-Dist: rich>=13.9.0
+Requires-Dist: safetensors>=0.4.5
+Requires-Dist: torch>=2.4.0
+Requires-Dist: transformers>=4.51.0
+Requires-Dist: trl>=0.16.0
+Requires-Dist: tqdm>=4.66.0
+Requires-Dist: xlrd>=2.0.1
+
 # 法律学习 Agent
 
 这份 README 服务两个目标：
@@ -28,7 +59,6 @@ conda activate "$AGENT_ENV_NAME"
 1. `scripts/create_agent_env.sh` 会根据 `environment.agent_env.yml` 创建或更新 `agent_env`。
 2. 这个环境文件已经包含 `requirements.txt`、`pytest` 和项目自身的 editable install。
 3. 如果以后有人补了新依赖，必须同时更新 `requirements.txt`，必要时同步更新 `environment.agent_env.yml`。
-4. 大多数脚本都会通过 `scripts/common.sh` 自动解析 `agent_env` 里的 Python 和相关可执行文件；只要 Conda 能找到这个环境，即使你当前 shell 还没 `conda activate`，脚本也可以直接运行。
 
 如果你只想在已有 `agent_env` 上补装依赖，可以运行：
 
@@ -52,44 +82,13 @@ HF_ENDPOINT=https://hf-mirror.com bash scripts/download_models.sh
 1. `models/embeddings/bge-small-zh`
 2. `models/qwen/Qwen3_4B`
 
-### 2. 下载 DISC-Law-SFT
-
-如果你的 `data/` 目录是空的，先执行：
-
-```bash
-bash scripts/download_disc_law.sh
-```
-
-这一步会把原始 jsonl 下载到 `data/disc_law/raw/`，并生成规范化文件 `data/disc_law/disc_law_normalized.jsonl`。
-
-如果你已经从组内共享数据中拿到了 `data/disc_law/`，可以跳过这一步。
-
-### 3. 生成学习场景数据并构建学习知识清单
+### 2. 构建学习知识清单
 
 ```bash
 bash scripts/build_study_knowledge.sh
 ```
 
-这一步会先检查并补齐 `data/legal_study_agent/` 下的四个运行时文件：
-
-1. `question_bank.jsonl`：模拟测试题库。
-2. `case_bank.jsonl`：案例讲解题库。
-3. `common_knowledge.jsonl`：学习方法与通用知识点。
-4. `system_seed_memories.json`：系统级学习记忆与回答策略。
-
-默认情况下：
-
-1. 如果这四个文件已经存在且数量足够，脚本会跳过重建。
-2. 如果它们缺失或只有仓库里的小样例，脚本会优先利用 `data/disc_law/disc_law_normalized.jsonl` 自动生成足量数据。
-3. 如果 `data/law_files/catalogs/law_catalog_master.csv` 存在，脚本还会用法规目录补充部分检索提示型常识条目。
-
-如果你需要强制重建这四个文件，可以执行：
-
-```bash
-FORCE_REBUILD=1 bash scripts/build_study_knowledge.sh
-```
-
-### 4. 准备法规检索资源
+### 3. 准备法规检索资源
 
 ```bash
 bash scripts/build_knowledge_base.sh
@@ -100,28 +99,17 @@ bash scripts/build_knowledge_base.sh
 1. 如果本地已经有 `data/law_files` 下的法规文件，它会直接构建语料和索引。
 2. 如果本地没有法规文件、但你配置了 Kaggle，它会尝试下载预构建的 RAG artifacts。
 
-也就是说，从“空的 data/artifacts/memory/models/reports 目录”起步时，完整可运行路径分成两种：
-
-1. 你有共享的 `data.zip` 或其他方式拿到 `data/law_files`：直接执行这一步即可本地构建法规检索资源。
-2. 你没有 `data/law_files`：请先配置 `~/.kaggle/kaggle.json`，再执行这一步，让脚本下载预构建 artifacts。
-
-如果要走 Kaggle 预构建 artifacts 路径，请确认两件事：
-
-1. `agent_env` 已经按上面的环境步骤创建完成。
-2. `~/.kaggle/kaggle.json` 已配置好可用凭证。
-
-如果你只想单独下载预构建的 RAG artifacts，也可以直接运行：
+如果你要先下载 DISC-Law-SFT 数据，也可以提前执行：
 
 ```bash
-bash scripts/download_rag_artifacts.sh
+bash scripts/download_disc_law.sh
 ```
 
-### 5. 运行核心测试
+### 4. 运行核心测试
 
 ```bash
 cd path/to/nlp_project
 PYTHONPATH=src python -m pytest \
-  tests/test_study_data_builder.py \
   tests/test_context_engine.py \
   tests/test_study_tools.py \
   tests/test_study_agent.py \
@@ -129,29 +117,19 @@ PYTHONPATH=src python -m pytest \
   tests/test_web_app.py
 ```
 
-这组核心回归应当在 `agent_env` 中全部通过；以当前 `pytest` 实际输出为准，不再在 README 里写死通过数量。
+当前这组核心回归已经在 `agent_env` 中通过，结果是 `12 passed`。
 
-说明：
-
-1. `memory/agent_memory` 和 `reports/user_reports` 不需要手工创建，运行时会自动生成。
-2. 如果 `data/legal_study_agent/` 没生成好，UI 可能能打开，但模拟测试、案例解释和学习报告不会完整可用。
-3. 如果 `artifacts/` 没有通过本地构建或 Kaggle 下载补齐，法规检索链路不会完整可用。
-
-### 6. 启动 Web UI
+### 5. 启动 Web UI
 
 ```bash
 bash scripts/launch_web_ui.sh
 ```
-
-脚本会优先使用 `127.0.0.1:7860`。如果 7860 已被占用，它会自动顺延到后续空闲端口，并在终端里打印实际使用的端口。
 
 默认地址：
 
 ```text
 http://127.0.0.1:7860
 ```
-
-如果 7860 已占用，请以终端里打印出来的实际地址为准。
 
 如果你要指定端口：
 
@@ -244,64 +222,6 @@ PYTHONPATH=src python -m legal_agent.cli web-ui \
   --retrieval-device cpu
 ```
 
-如果 7860 已占用，这条命令也会自动切换到后续空闲端口。
-
-## 上下文记忆默认实现
-
-当前默认运行路径里，上下文记忆相关配置从 `configs/study_agent.yaml` 读取，核心是 `memory` 段：
-
-```yaml
-turn_analysis_mode: llm
-
-memory:
-  recent_turn_window: 8
-  compression_after_turns: 10
-  compression_chunk_size: 8
-  retain_recent_turns: 6
-  vectorizer: embedding
-  embedding_model_path: models/embeddings/bge-small-zh
-  embedding_device: cpu
-```
-
-当前实现有几个关键事实：
-
-1. 默认记忆理解和写入走本地 Qwen reasoner，而不是固定句式匹配。
-2. 默认 study agent 路径会用本地 BGE 模型 `models/embeddings/bge-small-zh` 参与记忆召回。
-3. 最终召回不是“只看 BGE”，而是 lexical、embedding、importance、freshness、layer prior、hit bonus 和 graph bonus 的混合排序。
-4. `prepare_context` 是 planning、fallback 和训练轨迹使用的正式上下文接口。
-
-当前稳态落盘结构如下：
-
-```text
-memory/agent_memory/
-  system/
-    system_memories.jsonl
-  users/
-    <user_id>/
-      profile.json
-      memories.jsonl
-      memory_edges.jsonl
-      sessions/
-        <session_id>.json
-```
-
-其中：
-
-1. `profile.json` 是用户长期画像。
-2. `memories.jsonl` 是结构化记忆节点主文件。
-3. `memory_edges.jsonl` 是从记忆节点派生出来的图索引，只负责召回增强。
-4. `sessions/<session_id>.json` 是单会话状态、turns、考试状态和报告路径。
-
-`prepare_context` 当前会稳定返回 `summary_blocks`、`profile_hits`、`system_hits`、`working_hits`、`long_term_hits`、`session_hits`、`guaranteed_hits`、`related_hits`、`planning_context`、`retrieval_meta` 和 `maintenance`。
-
-如果你要观察运行时效果，直接看：
-
-1. `memory/agent_memory/users/<user_id>/profile.json`
-2. `memory/agent_memory/users/<user_id>/memories.jsonl`
-3. `memory/agent_memory/users/<user_id>/memory_edges.jsonl`
-4. `memory/agent_memory/users/<user_id>/sessions/<session_id>.json`
-5. `prepare_context` 返回里的 `summary_blocks`、`guaranteed_hits`、`retrieval_meta`
-
 ## 当前目录结构
 
 推荐把仓库理解成四层：
@@ -363,23 +283,22 @@ nlp_project/
 当前已实现：
 
 1. 分层 memory 数据结构。
-2. 文件型存储层，已收口为 `profile.json`、`memories.jsonl`、`memory_edges.jsonl` 和 `sessions/<session_id>.json`。
+2. 文件型存储层。
 3. 用户画像抽取与更新。
-4. 会话状态持久化与旧 session 结构自动迁移。
-5. 本地 embedding + 图增强的混合记忆召回。
-6. 历史压缩与 summary 记忆写回。
-7. 考试结果反哺用户画像。
-8. 报告快照生成。
-9. 用户与会话 CRUD。
+4. 会话状态持久化。
+5. 考试结果反哺用户画像。
+6. 报告快照生成。
+7. 用户与会话 CRUD。
 
-仍可继续优化的方向：
+你接下来要继续做的任务：
 
-1. 为 memory item 增加更细粒度的冲突消解和版本控制。
-2. 增加长期语义记忆 consolidation。
-3. 对同一用户跨会话共享的稳定事实做去重。
-4. 设计“用户删除”后的安全清理策略。
-5. 为画像更新添加可信度与来源标记。
-6. 继续优化多层记忆检索打分，减少无关历史命中。
+1. 为 memory item 增加冲突消解和版本控制。
+2. 增加 embedding 检索，替代当前 lexical + heuristic 命中。
+3. 增加长期语义记忆 consolidation。
+4. 对同一用户跨会话共享的稳定事实做去重。
+5. 设计“用户删除”后的安全清理策略。
+6. 为画像更新添加可信度与来源标记。
+7. 提高画像抽取准确率，减少错误自动写回。
 8. 优化多层记忆检索打分，减少无关历史命中。
 9. 为报告生成补更多结构化学习快照。
 

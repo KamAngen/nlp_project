@@ -6,14 +6,14 @@ from context_engine.schemas import ContextBundle
 from planning_engine.schema import ActionPlan, ToolPlanStep
 
 
-ANSWER_SHEET_RE = re.compile(r"(?:^|[\s,，；;])\d+\s*[\.、:：-]?\s*[A-Da-d]")
+ANSWER_SHEET_RE = re.compile(r"(?m)^\s*\d+\s*[\.、:：-]")
 QUESTION_COUNT_RE = re.compile(r"(?P<count>\d{1,2})\s*题")
 CALC_MARKERS = ("计算", "算", "赔偿", "补偿", "罚款", "税额", "利息", "金额", "数额")
 PROFILE_VIEW_MARKERS = ("我的档案", "我的画像", "我的信息", "查看档案", "查看画像")
 REPORT_MARKERS = ("报告", "总结", "学习画像", "学习总结", "学习报告", "周报")
 EXAM_MARKERS = ("法考测试", "模拟测试", "出题", "练习题", "刷题", "来一套", "模拟卷", "测试题")
 SUBJECT_MARKERS = ("民法", "刑法", "行政法", "民诉", "刑诉", "商经", "理论法", "宪法")
-PROFILE_UPDATE_MARKERS = ("记住", "我是", "我叫", "我在备考", "我的薄弱点", "我的强项", "目标分数")
+PROFILE_DISCLOSURE_HINTS = ("备考", "复习", "薄弱", "短板", "强项", "目标", "分数", "偏好", "习惯", "每天", "小时", "名字", "称呼")
 
 
 class StudyPlanner:
@@ -22,6 +22,7 @@ class StudyPlanner:
 
     def plan(self, query: str, context: ContextBundle, tool_definitions: list[dict[str, object]] | None = None) -> ActionPlan:
         intent = self._detect_intent(query, context)
+        planning_hint = self._planning_hint(context)
 
         if intent == "profile_lookup":
             return ActionPlan(
@@ -45,17 +46,16 @@ class StudyPlanner:
         if intent == "mock_exam_generate":
             return ActionPlan(
                 intent=intent,
-                objective="生成一套与当前学习目标相匹配的法考模拟题。",
+                objective=f"结合当前 planning_context 生成一套与当前学习目标相匹配的法考模拟题。{planning_hint}",
                 steps=[
-                    ToolPlanStep("profile_view", "先读取用户画像，确定选题偏好与难点。"),
-                    ToolPlanStep("memory_search", "优先命中用户画像里的薄弱点与近期学习主题。", {"query": query, "top_k": 6}),
                     ToolPlanStep(
                         "generate_exam",
-                        "根据题目需求和用户画像生成模拟卷。",
+                        "根据 planning_context 已整理出的薄弱点和当前主题生成模拟卷。",
                         {
                             "topic": self._extract_topic(query, context),
                             "question_count": self._extract_question_count(query),
                             "exam_type": self._extract_exam_type(query),
+                            "question_types": self._extract_question_types(query),
                         },
                     ),
                 ],
@@ -76,9 +76,8 @@ class StudyPlanner:
         if intent == "report_generation":
             return ActionPlan(
                 intent=intent,
-                objective="整理用户近期学习报告。",
+                objective=f"基于 summary_blocks 和 planning_context 整理用户近期学习报告。{planning_hint}",
                 steps=[
-                    ToolPlanStep("memory_search", "先检索近期会话、薄弱点和测试记录。", {"query": query, "top_k": 8}),
                     ToolPlanStep("generate_report", "生成结构化学习报告。", {"report_type": "study_progress"}),
                 ],
                 response_style="report",
@@ -87,9 +86,8 @@ class StudyPlanner:
         if intent == "legal_calculation":
             return ActionPlan(
                 intent=intent,
-                objective="结合法律知识和数字计算给出学习型分析。",
+                objective=f"结合 planning_context、法律知识和数字计算给出学习型分析。{planning_hint}",
                 steps=[
-                    ToolPlanStep("memory_search", "先读取与当前问题相关的历史上下文。", {"query": query, "top_k": 6}),
                     ToolPlanStep("rag_search", "检索法条、题库、案例与常识知识。", {"query": query, "top_k": 6}),
                     ToolPlanStep("calculator", "对用户显式提出的数字问题做安全计算。", {"expression": self._extract_expression(query)}),
                 ],
@@ -98,9 +96,8 @@ class StudyPlanner:
 
         return ActionPlan(
             intent="legal_qa",
-            objective="回答法律学习与法考相关问题，并给出知识依据。",
+            objective=f"结合 planning_context 回答法律学习与法考相关问题，并给出知识依据。{planning_hint}",
             steps=[
-                ToolPlanStep("memory_search", "先取回用户画像、最近对话和关键系统记忆。", {"query": query, "top_k": 6}),
                 ToolPlanStep("rag_search", "综合检索法条、题库、案例和常识知识。", {"query": query, "top_k": 6}),
             ],
             response_style="legal_analysis",
@@ -116,11 +113,19 @@ class StudyPlanner:
             return "report_generation"
         if any(marker in normalized for marker in EXAM_MARKERS):
             return "mock_exam_generate"
-        if any(marker in normalized for marker in PROFILE_UPDATE_MARKERS):
+        if self._looks_like_profile_update(normalized):
             return "profile_update"
         if self._looks_like_calculation(normalized):
             return "legal_calculation"
         return "legal_qa"
+
+    def _looks_like_profile_update(self, query: str) -> bool:
+        normalized = "".join(str(query or "").split())
+        if not normalized or "?" in normalized or "？" in normalized:
+            return False
+        if not any(hint in normalized for hint in PROFILE_DISCLOSURE_HINTS):
+            return False
+        return any(token in normalized for token in ("我", "我的", "以后", "之后"))
 
     def _looks_like_answer_sheet(self, query: str) -> bool:
         return bool(ANSWER_SHEET_RE.search(query)) or "我的答案" in query or "提交答案" in query
@@ -136,11 +141,23 @@ class StudyPlanner:
         for subject in SUBJECT_MARKERS:
             if subject in query:
                 return subject
+        for subject in SUBJECT_MARKERS:
+            if subject in context.planning_context:
+                return subject
         if context.user_profile.weak_points:
             return context.user_profile.weak_points[0]
         if context.user_profile.study_goals:
             return context.user_profile.study_goals[0]
         return "综合"
+
+    def _planning_hint(self, context: ContextBundle) -> str:
+        session_summary = str(context.summary_blocks.get("session") or "").strip()
+        if not session_summary:
+            return ""
+        compact = session_summary.replace("\n", " ").strip()
+        if len(compact) > 48:
+            compact = compact[:47].rstrip(" ，,；;") + "…"
+        return f"当前会话摘要：{compact}"
 
     def _extract_question_count(self, query: str) -> int:
         match = QUESTION_COUNT_RE.search(query)
@@ -157,6 +174,16 @@ class StudyPlanner:
         if "真题" in normalized:
             return "真题模拟"
         return "综合练习"
+
+    def _extract_question_types(self, query: str) -> list[str]:
+        normalized = "".join(str(query or "").split())
+        if any(marker in normalized for marker in ("简答", "主观", "问答")):
+            return ["short_answer"]
+        if any(marker in normalized for marker in ("案例", "案例分析")):
+            return ["case_analysis"]
+        if any(marker in normalized for marker in ("混合", "综合题型")):
+            return ["single_choice", "short_answer", "case_analysis"]
+        return ["single_choice"]
 
     def _extract_expression(self, query: str) -> str:
         candidate = query.replace("请", "").replace("帮我", "").strip()

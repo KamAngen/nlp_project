@@ -101,6 +101,20 @@ class _DummyAgent:
         )
 
 
+class _DeferredHistoryAgent(_DummyAgent):
+    def handle_message(self, question: str, *, user_id: str, session_id: str, **kwargs) -> StudyAgentResponse:
+        return StudyAgentResponse(
+            intent="legal_qa",
+            answer="这是延迟持久化时也应立即显示的最终答复。",
+            plan={"planner_backend": "llm_react"},
+            tool_results=[],
+            trace="Final Answer: 这是延迟持久化时也应立即显示的最终答复。",
+        )
+
+    def get_session_history(self, user_id: str, session_id: str):
+        return []
+
+
 def test_workspace_user_and_session_crud(tmp_path: Path, monkeypatch):
     dummy_agent = _DummyAgent(tmp_path)
     monkeypatch.setattr(unified_workspace, "_get_agent", lambda *args, **kwargs: dummy_agent)
@@ -169,6 +183,32 @@ def test_workspace_chat_exam_and_report_actions(tmp_path: Path, monkeypatch):
     )
     assert report_payload[3].startswith("# 学习报告")
     assert report_payload[4] is not None
+
+
+def test_workspace_submit_chat_renders_final_message_without_waiting_for_history_refresh(tmp_path: Path, monkeypatch):
+    dummy_agent = _DeferredHistoryAgent(tmp_path)
+    dummy_agent.create_user("赵六", display_name="赵六")
+    dummy_agent.create_session("赵六", "default_session")
+    monkeypatch.setattr(unified_workspace, "_get_agent", lambda *args, **kwargs: dummy_agent)
+    monkeypatch.setattr(unified_workspace, "_resolve_model_choice", lambda *args, **kwargs: ("models/qwen/Qwen3_4B", None))
+
+    state = {"user_id": "赵六", "session_id": "default_session", "trace": "", "report_markdown": "", "report_path": None, "pending_root_question": None, "pending_question": None, "clarification_answers": []}
+
+    updates = list(
+        unified_workspace._submit_chat(
+            "请解释听证程序适用情形",
+            state,
+            "models/qwen/Qwen3_4B",
+            "configs/defaults.yaml",
+            "configs/study_agent.yaml",
+            "auto",
+            "cpu",
+        )
+    )
+
+    final_payload = updates[-1]
+    assert final_payload[0][-1] == {"role": "assistant", "content": "这是延迟持久化时也应立即显示的最终答复。"}
+    assert final_payload[2]["last_assistant_message"] == "这是延迟持久化时也应立即显示的最终答复。"
 
 
 def test_workspace_ignores_missing_report_file(tmp_path: Path, monkeypatch):
