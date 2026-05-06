@@ -48,6 +48,7 @@ DIRECT_QA_MIN_HIT_SCORE = 0.18
 DIRECT_QA_MIN_STATUTE_SCORE = 0.12
 DIRECT_QA_MIN_TOKEN_OVERLAP = 2
 DIRECT_QA_MIN_DISPLAY_OVERLAP = 1
+DEFAULT_EXAM_QUESTION_TYPES = ["single_choice", "short_answer", "case_analysis"]
 SMALLTALK_MARKERS = (
     "你好",
     "您好",
@@ -239,7 +240,17 @@ class UnifiedLegalAgent:
                 return
 
         retrieval_device = retrieval_device or self.default_retrieval_device
+        yield {
+            "event": "status",
+            "message": "正在初始化模型与记忆模块。",
+            "trace": "[Init]\n正在初始化模型与记忆模块。",
+        }
         self._ensure_memory_reasoner(model_path=model_path, adapter_path=adapter_path, model_device=model_device)
+        yield {
+            "event": "status",
+            "message": "正在读取会话上下文并构建推理引擎。",
+            "trace": "[Init]\n正在初始化模型与记忆模块。\n[Init]\n正在读取会话上下文并构建推理引擎。",
+        }
         effective_question = self._normalize_runtime_question(question, user_id=user_id, session_id=session_id)
         history = self._session_history(user_id, session_id)
         engine = self._build_engine(
@@ -251,6 +262,11 @@ class UnifiedLegalAgent:
             retrieval_device=retrieval_device,
             model_device=model_device,
         )
+        yield {
+            "event": "status",
+            "message": "运行时初始化完成，开始规划下一步。",
+            "trace": "[Init]\n正在初始化模型与记忆模块。\n[Init]\n正在读取会话上下文并构建推理引擎。\n[Init]\n运行时初始化完成，开始规划下一步。",
+        }
         final_result: AgentRunResult | None = None
         for update in engine.run_with_updates(effective_question, history=history):
             if update.get("event") == "final":
@@ -440,6 +456,7 @@ class UnifiedLegalAgent:
             enable_thinking=self.legal_config.inference.enable_thinking,
             prompt_mode=prompt_mode,
             turn_analysis_mode=self.config.turn_analysis_mode,
+            use_planning_engine=True,
         )
 
     def _session_history(self, user_id: str, session_id: str, *, max_turns: int = 8) -> list[tuple[str, str]]:
@@ -563,7 +580,8 @@ class UnifiedLegalAgent:
         raw_question = str(question or "").strip()
         if not raw_question:
             return raw_question
-        if self._looks_like_answer_sheet(raw_question) and self.memory_manager.load_active_exam(user_id, session_id):
+        active_exam = self.memory_manager.load_active_exam(user_id, session_id)
+        if self._should_treat_as_exam_submission(raw_question, active_exam):
             return (
                 "用户刚提交了当前激活模拟测试的答案，请继续同一学习任务。\n"
                 f"答题卡：\n{raw_question}\n"
@@ -578,6 +596,29 @@ class UnifiedLegalAgent:
             return True
         inline_matches = INLINE_CHOICE_ANSWER_RE.findall(text)
         return len(inline_matches) >= 2 or bool(inline_matches and len(compact) <= 48)
+
+    def _should_treat_as_exam_submission(self, text: str, active_exam: dict[str, Any] | None) -> bool:
+        raw_text = str(text or "").strip()
+        if not raw_text or active_exam is None:
+            return False
+        if self._looks_like_answer_sheet(raw_text):
+            return True
+
+        exam_questions = [dict(item) for item in active_exam.get("questions", []) if isinstance(item, dict)]
+        if len(exam_questions) != 1:
+            return False
+
+        question_type = str(exam_questions[0].get("question_type") or "single_choice")
+        if question_type == "single_choice":
+            return False
+
+        if self._looks_like_smalltalk(raw_text):
+            return False
+        if raw_text.endswith(("?", "？")):
+            return False
+        if self._detect_button_only_intent(raw_text) is not None:
+            return False
+        return True
 
     def _looks_like_smalltalk(self, text: str) -> bool:
         normalized = str(text or "").strip().lower()
@@ -642,6 +683,33 @@ class UnifiedLegalAgent:
             report_path = str(result.get("report_path") or "") or report_path
             report_markdown = str(result.get("report_markdown") or "") or report_markdown
         return report_path, report_markdown
+
+    def _ensure_score_report(
+        self,
+        tool_results: list[dict[str, Any]],
+        *,
+        user_id: str,
+        session_id: str,
+        needs_user_input: bool,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        items = list(tool_results)
+        if needs_user_input or not self._has_tool(items, "score_exam") or self._has_tool(items, "generate_report"):
+            return items, False
+
+        items.append(
+            {
+                "tool_name": "generate_report",
+                "reason": "补全本次评分对应的学习反馈报告。",
+                "arguments": {"report_type": "mock_exam_review"},
+                "result": self.tool_executor.execute(
+                    "generate_report",
+                    {"report_type": "mock_exam_review"},
+                    user_id=user_id,
+                    session_id=session_id,
+                ),
+            }
+        )
+        return items, True
 
     def _has_tool(self, tool_results: list[dict[str, Any]], tool_name: str) -> bool:
         return any(str(entry.get("tool_name") or "") == tool_name for entry in tool_results)
@@ -736,6 +804,12 @@ class UnifiedLegalAgent:
                 if fallback_payload.get("answer") is not None:
                     result.final_answer = str(fallback_payload.get("answer") or result.final_answer)
 
+        tool_results, auto_generated_score_report = self._ensure_score_report(
+            tool_results,
+            user_id=user_id,
+            session_id=session_id,
+            needs_user_input=result.needs_user_input,
+        )
         report_path, report_markdown = self._extract_report_artifacts(tool_results)
         intent = self._infer_intent(tool_results, result.needs_user_input)
         answer = self._postprocess_answer(result.final_answer, tool_results)
@@ -749,6 +823,8 @@ class UnifiedLegalAgent:
             answer = f"为继续分析，请先补充：{result.clarification_question}"
         elif intent != "mock_exam_generate" and (used_direct_fallback or "Final Answer:" in str(result.trace or "")):
             result.trace = self._sync_trace_final_answer(result.trace, answer)
+        if auto_generated_score_report:
+            result.trace = (result.trace.rstrip() + "\n\n[Auto Report]\nscore_exam -> generate_report").strip()
 
         return StudyAgentResponse(
             intent=intent,
@@ -845,7 +921,8 @@ class UnifiedLegalAgent:
         adapter_path: str | None,
         model_device: str,
     ) -> dict[str, Any] | None:
-        if self._looks_like_answer_sheet(question) and self.memory_manager.load_active_exam(user_id, session_id):
+        active_exam = self.memory_manager.load_active_exam(user_id, session_id)
+        if self._should_treat_as_exam_submission(question, active_exam):
             return self._build_direct_score_payload(question, user_id=user_id, session_id=session_id)
         profile_updates = self.memory_manager.extract_profile_updates_for_user(question, user_id=user_id, session_id=session_id)
         profile_update_steps = self._profile_update_steps(question, profile_updates, user_id=user_id, session_id=session_id)
@@ -1016,13 +1093,13 @@ class UnifiedLegalAgent:
             exam_type = "章节练习"
         elif "真题" in compact:
             exam_type = "真题模拟"
-        question_types = ["single_choice"]
+        question_types = list(DEFAULT_EXAM_QUESTION_TYPES)
         if any(marker in compact for marker in ["简答", "主观", "问答"]):
             question_types = ["short_answer"]
         elif any(marker in compact for marker in ["案例", "案例分析"]):
             question_types = ["case_analysis"]
         elif any(marker in compact for marker in ["混合", "综合题型"]):
-            question_types = ["single_choice", "short_answer", "case_analysis"]
+            question_types = list(DEFAULT_EXAM_QUESTION_TYPES)
         return topic, question_count, exam_type, question_types
 
     def _build_direct_profile_update_payload(
@@ -1273,10 +1350,10 @@ class UnifiedLegalAgent:
             {
                 "tool_name": "generate_exam",
                 "reason": "依据画像与题型偏好生成模拟题。",
-                "arguments": {"topic": topic, "question_count": question_count, "exam_type": exam_type, "question_types": question_types or ["single_choice"]},
+                "arguments": {"topic": topic, "question_count": question_count, "exam_type": exam_type, "question_types": question_types or DEFAULT_EXAM_QUESTION_TYPES},
                 "result": self.tool_executor.execute(
                     "generate_exam",
-                    {"topic": topic, "question_count": question_count, "exam_type": exam_type, "question_types": question_types or ["single_choice"]},
+                    {"topic": topic, "question_count": question_count, "exam_type": exam_type, "question_types": question_types or DEFAULT_EXAM_QUESTION_TYPES},
                     user_id=user_id,
                     session_id=session_id,
                 ),
@@ -1450,7 +1527,7 @@ class UnifiedLegalAgent:
         self._record_turn(
             user_id,
             session_id,
-            f"[UI操作] 生成模拟测试 exam_type={exam_type} topic={topic} question_count={question_count} question_types={','.join(question_types or ['single_choice'])}",
+            f"[UI操作] 生成模拟测试 exam_type={exam_type} topic={topic} question_count={question_count} question_types={','.join(question_types or DEFAULT_EXAM_QUESTION_TYPES)}",
             answer,
             tool_results,
             reasoning_trace=trace,
@@ -1525,11 +1602,14 @@ class UnifiedLegalAgent:
             "以下是为当前用户生成的法考模拟测试题目：",
             f"主题：{exam_payload.get('topic', '综合')}，题型：{exam_payload.get('exam_type', '综合练习')}，共 {exam_payload.get('question_count', 0)} 题。",
             f"本次选题优先参考的画像标签：{'、'.join(profile_tags[:5]) or '当前画像暂无额外选题标签，已按当前题型与主题要求出题'}。",
-            f"本轮已随机回放错题库 {exam_payload.get('reused_wrong_question_count', 0)} 题。",
             *selection_notes,
             answer_instruction,
             "",
         ]
+        if exam_payload.get("exam_type") == "薄弱点强化":
+            lines.insert(3, f"本轮按薄弱点强化回放错题库 {exam_payload.get('reused_wrong_question_count', 0)} 题。")
+        else:
+            lines.insert(3, "当前为常规练习模式，不会主动混入错题库题目。")
         for question in exam_payload.get("questions", []):
             question_type = str(question.get("question_type") or "single_choice")
             type_label = {
@@ -1553,51 +1633,129 @@ class UnifiedLegalAgent:
         earned_score = score_payload.get("earned_score", 0)
         total_score = score_payload.get("total_score", 0)
         wrong_questions = list(score_payload.get("wrong_questions") or [])
+        details = list(score_payload.get("details") or [])
         weak_tags = list(score_payload.get("weak_tags") or [])
         strong_tags = list(score_payload.get("strong_tags") or [])
+        mastered_count = int(score_payload.get("mastered_count") or 0)
+        review_count = int(score_payload.get("review_count") or 0)
+        incorrect_count = int(score_payload.get("incorrect_count") or 0)
+        unanswered_count = int(score_payload.get("unanswered_count") or 0)
 
-        lines = [f"本次测试得分：{score_percent} 分（{earned_score}/{total_score}）。"]
+        lines = [
+            f"本次测试得分：{score_percent} 分（{earned_score}/{total_score}）。",
+            f"评分概览：掌握较稳 {mastered_count} 题，待巩固 {review_count} 题，错题 {incorrect_count} 题，未作答 {unanswered_count} 题。",
+        ]
+        if weak_tags:
+            lines.append(f"本轮主要薄弱点：{'、'.join(weak_tags[:6])}。")
+        if strong_tags:
+            lines.append(f"本轮表现较稳的知识点：{'、'.join(strong_tags[:6])}。")
         if wrong_questions:
-            lines.append(f"本轮主要薄弱点：{'、'.join(weak_tags[:6]) or '待继续复盘'}。")
-            lines.append("以下是需要重点复盘的题目：")
-            for question in wrong_questions[:5]:
-                index = question.get("index")
-                user_answer = question.get("user_answer") or "未作答"
-                correct_answer = question.get("correct_answer") or "未提供"
-                question_type = str(question.get("question_type") or "single_choice")
-                options = dict(question.get("options") or {})
-                correct_option_text = str(options.get(correct_answer) or "").strip()
-                title = f"第{index}题" if index else "错题"
+            wrong_indexes = [str(item.get("index")) for item in wrong_questions if item.get("index")]
+            if wrong_indexes:
+                lines.append(f"已记入错题库复盘的题目：第 {'、'.join(wrong_indexes)} 题。")
+        elif incorrect_count == 0:
+            lines.append("本轮没有需要记入错题库的题目。")
+
+        if details:
+            lines.extend(["", "逐题反馈："])
+            for detail in details:
+                index = detail.get("index")
+                question_type = str(detail.get("question_type") or "single_choice")
+                type_label = {
+                    "single_choice": "单选题",
+                    "short_answer": "简答题",
+                    "case_analysis": "案例分析题",
+                }.get(question_type, question_type)
+                classification = str(detail.get("classification") or ("mastered" if detail.get("is_correct") else "incorrect"))
+                status_label = {
+                    "mastered": "掌握较稳",
+                    "review": "待巩固",
+                    "incorrect": "错题",
+                    "unanswered": "未作答",
+                }.get(classification, classification)
+                prompt = str(detail.get("question") or "").strip()
+                options = dict(detail.get("options") or {})
+                user_answer = str(detail.get("display_user_answer") or detail.get("user_answer") or "").strip()
+                correct_answer = str(detail.get("correct_answer") or "").strip()
+
+                lines.append(f"第{index}题 [{type_label}] {status_label}")
+                if prompt:
+                    lines.append(
+                        f"题干：{self._format_exam_feedback_text(prompt, question_type=question_type, field='question')}"
+                    )
+                lines.append(f"得分：{detail.get('score', 0)}/{detail.get('max_score', 20)}")
                 if question_type == "single_choice":
-                    lines.append(f"{title}：你的答案是 {user_answer}，正确答案是 {correct_answer}。")
-                    if correct_option_text:
-                        lines.append(f"正确选项内容：{correct_option_text}")
+                    lines.append(f"你的作答：{self._format_choice_answer(user_answer, options, unanswered_label='未作答')}")
+                    lines.append(f"正确答案：{self._format_choice_answer(correct_answer, options, unanswered_label='未提供')}")
                 else:
                     lines.append(
-                        f"{title}：你得了 {question.get('earned_score', 0)}/{question.get('max_score', 20)} 分。"
+                        f"你的作答：{self._format_exam_feedback_text(user_answer, question_type=question_type, field='answer') if user_answer else '未作答'}"
                     )
-                    lines.append(f"你的作答：{truncate_text(str(user_answer), 140)}")
-                    if correct_answer:
-                        lines.append(f"参考答案：{truncate_text(str(correct_answer), 200)}")
-                    feedback = str(question.get("grading_feedback") or "").strip()
+                    feedback = str(detail.get("grading_feedback") or "").strip()
                     if feedback:
-                        lines.append(f"评价：{feedback}")
-                    missing_points = [str(item) for item in question.get("missing_points", []) if str(item).strip()]
+                        lines.append(f"评语：{feedback}")
+                    matched_points = [str(item) for item in detail.get("matched_points", []) if str(item).strip()]
+                    if matched_points:
+                        lines.append(f"答到的要点：{'；'.join(matched_points[:3])}")
+                    missing_points = [str(item) for item in detail.get("missing_points", []) if str(item).strip()]
                     if missing_points:
-                        lines.append(f"欠缺要点：{'；'.join(missing_points[:3])}")
-                analysis = str(question.get("analysis") or "").strip()
+                        lines.append(f"待补要点：{'；'.join(missing_points[:3])}")
+                    if correct_answer:
+                        lines.append(
+                            f"参考要点：{self._format_exam_feedback_text(correct_answer, question_type=question_type, field='reference')}"
+                        )
+                analysis = str(detail.get("analysis") or "").strip()
                 if analysis:
-                    lines.append(f"解释：{truncate_text(analysis, 220)}")
-                prompt = str(question.get("question") or "").strip()
-                if prompt:
-                    lines.append(f"题干：{truncate_text(prompt, 120)}")
-        else:
-            lines.append("本轮没有错题，说明这套题目前掌握得比较稳。")
-            if strong_tags:
-                lines.append(f"本轮表现较稳的知识点：{'、'.join(strong_tags[:6])}。")
+                    lines.append(
+                        f"解析：{self._format_exam_feedback_text(analysis, question_type=question_type, field='analysis')}"
+                    )
+                lines.append("")
+            while lines and not lines[-1].strip():
+                lines.pop()
         if str(report_payload.get("report_path") or "").strip():
             lines.append("学习反馈报告已同步到右侧面板，并写入报告目录。")
         return "\n".join(lines)
+
+    def _format_exam_feedback_text(
+        self,
+        text: str | None,
+        *,
+        question_type: str,
+        field: str,
+    ) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return ""
+        limits = {
+            ("case_analysis", "question"): 1600,
+            ("case_analysis", "answer"): 1800,
+            ("case_analysis", "reference"): 1400,
+            ("case_analysis", "analysis"): 1400,
+            ("short_answer", "question"): 900,
+            ("short_answer", "answer"): 1200,
+            ("short_answer", "reference"): 1000,
+            ("short_answer", "analysis"): 1000,
+        }
+        limit = limits.get((question_type, field), 360)
+        if len(normalized) <= limit:
+            return normalized
+        return truncate_text(normalized, limit)
+
+    def _format_choice_answer(
+        self,
+        answer: str | None,
+        options: dict[str, Any],
+        *,
+        unanswered_label: str,
+    ) -> str:
+        normalized = str(answer or "").strip()
+        if not normalized:
+            return unanswered_label
+        label = normalized[:1].upper()
+        option_text = str(options.get(label) or "").strip()
+        if option_text:
+            return f"{label}. {option_text}"
+        return normalized
 
     def _render_exam_trace(self, tool_results: list[dict[str, Any]], answer: str) -> str:
         trace_lines: list[str] = []

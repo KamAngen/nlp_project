@@ -96,6 +96,15 @@ def test_planner_uses_planning_context_when_query_has_no_subject():
     assert plan.steps[-1].arguments["topic"] == "刑法"
 
 
+def test_planner_treats_colloquial_deposit_dispute_as_legal_qa():
+    planner = StudyPlanner()
+
+    plan = planner.plan("押金到期不退怎么办？", _context())
+
+    assert plan.intent == "legal_qa"
+    assert [step.tool_name for step in plan.steps] == ["memory_search", "rag_search"]
+
+
 # ==================== Schema 新增字段测试 ====================
 
 def test_action_plan_has_original_query_field():

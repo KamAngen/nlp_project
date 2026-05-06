@@ -116,6 +116,7 @@ class AppConfig:
     generation: GenerationConfig
     training: TrainingConfig
     inference: InferenceConfig
+    public: bool = False
 
     @property
     def manifest_path(self) -> Path:
@@ -218,6 +219,7 @@ def load_app_config(config_path: str | Path) -> AppConfig:
         disc_law_dir=_resolve_path(raw["disc_law_dir"], project_root),
         generated_data_dir=_resolve_path(raw["generated_data_dir"], project_root),
         output_root=_resolve_path(raw["output_root"], project_root),
+        public=bool(raw.get("public", False)),
         available_gpu_ids=[int(item) for item in raw.get("available_gpu_ids", [1, 2, 4, 6])],
         models=_build_models(raw["models"], project_root),
         retrieval=RetrievalConfig(**raw.get("retrieval", {})),

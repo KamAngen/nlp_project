@@ -11,10 +11,19 @@ ACTION_RE = re.compile(r"^Action:\s*([A-Za-z_][A-Za-z0-9_]*)\((.*)\)\s*$", re.M)
 FINAL_RE = re.compile(r"^Final Answer:\s*(.*)", re.M | re.S)
 
 TOOL_ARG_ORDER: dict[str, list[str]] = {
+    "prepare_context": ["query"],
+    "memory_search": ["query", "top_k"],
+    "profile_upsert": ["raw_text", "updates"],
+    "profile_view": [],
+    "rag_search": ["query", "sources", "top_k"],
     "retrieve_from_kb": ["query", "top_k", "effect_level"],
     "lookup_statute": ["title"],
     "resolve_hierarchy": ["title_or_category"],
     "calculator": ["expression"],
+    "generate_exam": ["topic", "question_count", "exam_type", "question_types"],
+    "score_exam": ["answers_text", "exam_session_id"],
+    "generate_report": ["report_type"],
+    "ask_followup": ["question", "slot"],
     "ask_user": ["question", "field_name"],
 }
 

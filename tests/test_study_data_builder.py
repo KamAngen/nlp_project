@@ -333,16 +333,20 @@ def test_prepare_study_knowledge_assets_emits_structured_question_types_when_reb
     )
 
     question_rows = list(read_jsonl(study_config.question_bank_path))
+    case_rows = list(read_jsonl(study_config.case_bank_path))
     auto_rows = [row for row in question_rows if str(row.get("question_id") or "").startswith("auto-q-")]
+    auto_case_rows = [row for row in case_rows if str(row.get("case_id") or "").startswith("auto-case-")]
 
     assert summary["generated"] is True
-    assert summary["question_type_distribution"].get("single_choice", 0) >= 1
     assert summary["question_type_distribution"].get("short_answer", 0) >= 1
+    assert summary["case_count"] >= 1
     assert auto_rows
+    assert auto_case_rows
     assert all(str(row.get("question_type") or "").strip() for row in auto_rows)
     assert all(str(row.get("evaluation_mode") or "").strip() for row in auto_rows)
     assert all(str(row.get("reference_answer") or "").strip() for row in auto_rows)
     assert all(isinstance(row.get("source_metadata"), dict) for row in auto_rows)
+    assert all(row.get("options") or row.get("question_type") != "single_choice" for row in auto_rows)
 
 
 def test_candidate_topic_inference_prefers_reference_law_over_generic_mediation_keyword():

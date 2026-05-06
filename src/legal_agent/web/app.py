@@ -5,6 +5,7 @@ import socket
 
 import gradio as gr
 
+from legal_agent.config import load_app_config
 from legal_agent.web.unified_workspace import build_unified_workspace
 
 
@@ -501,7 +502,10 @@ def launch_web_ui(
     host: str = "127.0.0.1",
     port: int = 7860,
     retrieval_device: str = "cpu",
+    public: bool | None = None,
 ) -> None:
+    app_config = load_app_config(config_path)
+    share = app_config.public if public is None else bool(public)
     theme = gr.themes.Soft(primary_hue="amber", neutral_hue="stone")
     blocks_kwargs, launch_kwargs = _blocks_runtime_kwargs(theme=theme, css=CSS)
     with gr.Blocks(title="统一法律学习 Agent", **blocks_kwargs) as demo:
@@ -519,4 +523,4 @@ def launch_web_ui(
     launch_port = _resolve_launch_port(host, port)
     if launch_port != port:
         print(f"[web-ui] 端口 {port} 已被占用，自动切换到 {launch_port}。")
-    demo.launch(server_name=host, server_port=launch_port, **launch_kwargs)
+    demo.launch(server_name=host, server_port=launch_port, share=share, **launch_kwargs)

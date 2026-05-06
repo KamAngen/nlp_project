@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from legal_agent.web import app as web_app
 
 
@@ -8,6 +10,7 @@ def test_launch_web_ui_uses_unified_workspace(monkeypatch):
     monkeypatch.setattr(web_app.gr.Blocks, "queue", lambda self, **kwargs: self)
     monkeypatch.setattr(web_app, "_resolve_launch_port", lambda host, port, fallback_window=50: port)
     monkeypatch.setattr(web_app.gr.Blocks, "launch", lambda self, **kwargs: called.update({"launch": kwargs}))
+    monkeypatch.setattr(web_app, "load_app_config", lambda path: SimpleNamespace(public=True))
 
     web_app.launch_web_ui(
         config_path="configs/defaults.yaml",
@@ -22,6 +25,7 @@ def test_launch_web_ui_uses_unified_workspace(monkeypatch):
     assert called["retrieval_device"] == "cpu"
     assert called["launch"]["server_name"] == "127.0.0.1"
     assert called["launch"]["server_port"] == 7860
+    assert called["launch"]["share"] is True
 
 
 def test_launch_web_ui_falls_back_when_default_port_is_busy(monkeypatch, capsys):
@@ -31,6 +35,7 @@ def test_launch_web_ui_falls_back_when_default_port_is_busy(monkeypatch, capsys)
     monkeypatch.setattr(web_app.gr.Blocks, "queue", lambda self, **kwargs: self)
     monkeypatch.setattr(web_app, "_resolve_launch_port", lambda host, port, fallback_window=50: 7861)
     monkeypatch.setattr(web_app.gr.Blocks, "launch", lambda self, **kwargs: called.update({"launch": kwargs}))
+    monkeypatch.setattr(web_app, "load_app_config", lambda path: SimpleNamespace(public=False))
 
     web_app.launch_web_ui(
         config_path="configs/defaults.yaml",
@@ -41,6 +46,7 @@ def test_launch_web_ui_falls_back_when_default_port_is_busy(monkeypatch, capsys)
     )
 
     assert called["launch"]["server_port"] == 7861
+    assert called["launch"]["share"] is False
     output = capsys.readouterr().out
     assert "7860" in output
     assert "7861" in output

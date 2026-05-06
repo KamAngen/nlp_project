@@ -58,6 +58,18 @@ GENERAL_QA_INDICATORS = (
     "谢谢", "感谢", "辛苦了", "你好厉害",
 )
 
+LEGAL_DISPUTE_MARKERS = (
+    "押金", "租金", "房东", "房客", "租客", "退款", "退费", "违约", "拖欠", "欠款", "欠钱",
+    "借条", "借款", "辞退", "裁员", "赔偿", "侵权", "物业", "中介", "加班费", "工资",
+    "社保", "工伤", "货款", "尾款", "定金", "担保", "仲裁", "起诉", "报警", "立案",
+    "执行", "强制执行",
+)
+
+LEGAL_DISPUTE_ACTION_MARKERS = (
+    "怎么办", "怎么处理", "如何处理", "怎么维权", "如何维权", "能起诉吗", "能报警吗",
+    "合法吗", "算违法吗", "能不能", "可以吗", "应不应该",
+)
+
 EXAM_TYPE_PATTERNS = {
     "薄弱点强化": ("薄弱", "错题", "弱点", "容易错"),
     "章节练习": ("章节", "第.*章", "专项"),
@@ -416,7 +428,7 @@ class StudyPlanner:
             return ["case_analysis"]
         if any(marker in normalized for marker in ("混合", "综合题型")):
             return ["single_choice", "short_answer", "case_analysis"]
-        return ["single_choice"]
+        return ["single_choice", "short_answer", "case_analysis"]
 
     def _extract_expression(self, query: str) -> str:
         candidate = str(query or "").strip()
@@ -664,7 +676,7 @@ class StudyPlanner:
             "report_generation": "generate_report",
             "legal_calculation": "calculator",
             "followup_answer": "rag_search",
-            "legal_qa": "memory_search",
+            "legal_qa": "prepare_context",
         }
         return step_map.get(intent, "unknown")
 
@@ -747,6 +759,14 @@ class StudyPlanner:
         normalized = str(query or "").strip()
         if not normalized:
             return False
+
+        if any(marker in normalized for marker in LEGAL_DISPUTE_MARKERS):
+            if (
+                any(marker in normalized for marker in LEGAL_DISPUTE_ACTION_MARKERS)
+                or any(marker in normalized for marker in ("不退", "不给", "不发", "拖欠", "被扣", "被辞退"))
+                or normalized.endswith(("怎么办", "可以吗", "能行吗", "合法吗", "算违法吗", "怎么处理"))
+            ):
+                return True
 
         legal_count = sum(1 for kw in LEGAL_KEYWORDS if kw in normalized)
         if legal_count >= 1:

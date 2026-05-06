@@ -9,6 +9,7 @@ class _DummyAgent:
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
         self.users: dict[str, dict[str, object]] = {}
+        self.last_generate_exam_kwargs: dict[str, object] | None = None
 
     def list_users(self) -> list[str]:
         return sorted(self.users)
@@ -75,6 +76,7 @@ class _DummyAgent:
         yield {"event": "final", "response": self.handle_message(question, user_id=user_id, session_id=session_id, **kwargs)}
 
     def generate_exam(self, *, user_id: str, session_id: str, topic: str | None = None, question_count: int | None = None, **kwargs) -> StudyAgentResponse:
+        self.last_generate_exam_kwargs = dict(kwargs)
         self.users[user_id]["sessions"][session_id]["turns"].append((f"[UI操作] 生成模拟测试 topic={topic} question_count={question_count}", "已生成模拟测试"))
         self.users[user_id]["sessions"][session_id]["active_exam_session_id"] = "exam-1"
         return StudyAgentResponse(
@@ -154,6 +156,11 @@ def test_workspace_chat_exam_and_report_actions(tmp_path: Path, monkeypatch):
     )
     )
     assert chat_updates[0][0][-1] == {"role": "assistant", "content": "已接收问题，正在规划下一步。"}
+    assert chat_updates[0][1].startswith("[UI]")
+
+    streaming_payload = chat_updates[1]
+    assert streaming_payload[0][-1] == {"role": "assistant", "content": "正在规划下一步。"}
+    assert streaming_payload[1] == "Thought: 正在规划。"
 
     chat_payload = chat_updates[-1]
     assert chat_payload[0][-1] == {"role": "assistant", "content": "统一回答"}
@@ -171,6 +178,24 @@ def test_workspace_chat_exam_and_report_actions(tmp_path: Path, monkeypatch):
         "cpu",
     )
     assert any(msg["content"] == "已生成模拟测试" for msg in exam_payload[0] if msg["role"] == "assistant")
+    assert dummy_agent.last_generate_exam_kwargs is not None
+    assert dummy_agent.last_generate_exam_kwargs["question_types"] == ["single_choice", "short_answer", "case_analysis"]
+
+    subjective_exam_payload = unified_workspace._run_exam_action(
+        "章节练习",
+        "行政法",
+        2,
+        chat_payload[2],
+        "models/qwen/Qwen3_4B",
+        "configs/defaults.yaml",
+        "configs/study_agent.yaml",
+        "auto",
+        "cpu",
+        "简答题",
+    )
+    assert any(msg["content"] == "已生成模拟测试" for msg in subjective_exam_payload[0] if msg["role"] == "assistant")
+    assert dummy_agent.last_generate_exam_kwargs is not None
+    assert dummy_agent.last_generate_exam_kwargs["question_types"] == ["short_answer"]
 
     report_payload = unified_workspace._run_report_action(
         "学习进度报告",
@@ -246,6 +271,13 @@ def test_runtime_device_choices_hide_unavailable_cuda(monkeypatch):
 
     assert choices == ["auto", "cpu"]
     assert default_value == "auto"
+
+
+def test_runtime_device_switch_keeps_default_retrieval_device():
+    retrieval_device, model_device = unified_workspace._resolve_runtime_devices("cuda:0", "cpu")
+
+    assert retrieval_device == "cpu"
+    assert model_device == "cuda:0"
 
 
 def test_workspace_columns_keep_ratio_layout_hooks():

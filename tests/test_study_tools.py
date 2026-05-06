@@ -454,12 +454,358 @@ def test_generate_exam_supports_subjective_rows_and_partial_credit_scoring(tmp_p
 
     score_payload = tools.execute(
         "score_exam",
-        {"answers_text": "1. 应当先说明情况紧急，否则损害会扩大。", "exam_session_id": exam_payload["exam_session_id"]},
+        {"answers_text": "第1题：应当先说明情况紧急，否则损害会扩大。", "exam_session_id": exam_payload["exam_session_id"]},
         user_id="u1",
         session_id="s1",
     )
 
     assert score_payload["score_percent"] == 60.0
     assert score_payload["details"][0]["score"] == 12
+    assert score_payload["details"][0]["user_answer"] == "应当先说明情况紧急，否则损害会扩大。"
     assert score_payload["details"][0]["grading_feedback"] == "抓住了紧急性，但遗漏了担保要件。"
-    assert score_payload["wrong_questions"][0]["missing_points"] == ["依法提供担保"]
+    assert score_payload["details"][0]["classification"] == "review"
+    assert score_payload["review_count"] == 1
+    assert score_payload["incorrect_count"] == 0
+    assert score_payload["wrong_questions"] == []
+    assert score_payload["review_questions"][0]["missing_points"] == ["依法提供担保"]
+
+    profile = tools.memory_manager.get_user_profile("u1")
+    wrong_bank = dict(profile.attributes.get("wrong_question_bank") or {})
+
+    assert "sa-1" not in wrong_bank
+    assert "民诉" in profile.weak_points
+
+
+def test_score_exam_accepts_single_subjective_answer_without_numbering(tmp_path: Path):
+    def fake_grader(question: dict[str, object], user_answer: str) -> dict[str, object]:
+        assert user_answer.startswith("应先说明情况紧急")
+        return {
+            "score": 16,
+            "feedback": "主要结论到位，但论证展开还可以更完整。",
+            "matched_points": ["提到情况紧急"],
+            "missing_points": ["担保要求展开不足"],
+        }
+
+    tools = _build_custom_tools(
+        tmp_path,
+        [
+            {
+                "question_id": "sa-2",
+                "topic": "民诉",
+                "question": "申请诉前财产保全时，申请人通常需要说明哪些核心条件？",
+                "question_type": "short_answer",
+                "evaluation_mode": "llm_subjective",
+                "reference_answer": "应说明情况紧急，不立即保全将导致合法权益受到难以弥补的损害，并依法提供担保。",
+                "answer": "应说明情况紧急，不立即保全将导致合法权益受到难以弥补的损害，并依法提供担保。",
+                "analysis": "诉前保全通常要求紧急性和担保两项核心条件。",
+                "tags": ["民诉", "保全"],
+                "score": 20,
+            }
+        ],
+        subjective_exam_grader=fake_grader,
+    )
+
+    exam_payload = tools.execute(
+        "generate_exam",
+        {"topic": "民诉", "question_count": 1, "exam_type": "章节练习", "question_types": ["short_answer"]},
+        user_id="u1",
+        session_id="s1",
+    )
+
+    score_payload = tools.execute(
+        "score_exam",
+        {"answers_text": "应先说明情况紧急，否则可能来不及保全。", "exam_session_id": exam_payload["exam_session_id"]},
+        user_id="u1",
+        session_id="s1",
+    )
+
+    assert score_payload["unanswered_count"] == 0
+    assert score_payload["details"][0]["user_answer"] == "应先说明情况紧急，否则可能来不及保全。"
+    assert score_payload["details"][0]["classification"] == "mastered"
+
+
+def test_score_exam_splits_inline_subjective_answers_across_multiple_questions(tmp_path: Path):
+    seen_answers: list[tuple[int, str]] = []
+
+    def fake_grader(question: dict[str, object], user_answer: str) -> dict[str, object]:
+        seen_answers.append((int(question.get("index") or 0), user_answer))
+        return {
+            "score": 20,
+            "feedback": "要点完整。",
+            "matched_points": [user_answer],
+            "missing_points": [],
+            "quality_level": "mastered",
+        }
+
+    tools = _build_custom_tools(
+        tmp_path,
+        [
+            {
+                "question_id": "sa-inline-1",
+                "topic": "民诉",
+                "question": "申请诉前财产保全时，申请人通常需要说明哪些核心条件？",
+                "question_type": "short_answer",
+                "evaluation_mode": "llm_subjective",
+                "reference_answer": "应说明情况紧急，并依法提供担保。",
+                "answer": "应说明情况紧急，并依法提供担保。",
+                "analysis": "诉前保全通常要求紧急性和担保。",
+                "tags": ["民诉", "保全"],
+                "score": 20,
+            },
+            {
+                "question_id": "sa-inline-2",
+                "topic": "民诉",
+                "question": "人民法院采取证据保全措施的前提通常是什么？",
+                "question_type": "short_answer",
+                "evaluation_mode": "llm_subjective",
+                "reference_answer": "证据可能灭失或者以后难以取得。",
+                "answer": "证据可能灭失或者以后难以取得。",
+                "analysis": "证据保全通常适用于证据可能灭失或者以后难以取得的情形。",
+                "tags": ["民诉", "证据"],
+                "score": 20,
+            },
+        ],
+        subjective_exam_grader=fake_grader,
+    )
+
+    exam_payload = tools.execute(
+        "generate_exam",
+        {"topic": "民诉", "question_count": 2, "exam_type": "章节练习", "question_types": ["short_answer"]},
+        user_id="u1",
+        session_id="s1",
+    )
+
+    score_payload = tools.execute(
+        "score_exam",
+        {
+            "answers_text": "1. 应当说明情况紧急，并依法提供担保。 2. 证据可能灭失或者以后难以取得。",
+            "exam_session_id": exam_payload["exam_session_id"],
+        },
+        user_id="u1",
+        session_id="s1",
+    )
+
+    assert score_payload["unanswered_count"] == 0
+    assert seen_answers == [
+        (1, "应当说明情况紧急，并依法提供担保。"),
+        (2, "证据可能灭失或者以后难以取得。"),
+    ]
+    assert [detail["classification"] for detail in score_payload["details"]] == ["mastered", "mastered"]
+
+
+def test_score_exam_treats_blank_subjective_answer_as_unanswered_without_calling_grader(tmp_path: Path):
+    called = False
+
+    def fake_grader(question: dict[str, object], user_answer: str) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {
+            "score": 20,
+            "feedback": "不应调用。",
+            "matched_points": [],
+            "missing_points": [],
+            "quality_level": "mastered",
+        }
+
+    tools = _build_custom_tools(
+        tmp_path,
+        [
+            {
+                "question_id": "sa-blank-1",
+                "topic": "民诉",
+                "question": "申请诉前财产保全时，申请人通常需要说明哪些核心条件？",
+                "question_type": "short_answer",
+                "evaluation_mode": "llm_subjective",
+                "reference_answer": "应说明情况紧急，并依法提供担保。",
+                "answer": "应说明情况紧急，并依法提供担保。",
+                "analysis": "诉前保全通常要求紧急性和担保。",
+                "tags": ["民诉", "保全"],
+                "score": 20,
+            }
+        ],
+        subjective_exam_grader=fake_grader,
+    )
+
+    exam_payload = tools.execute(
+        "generate_exam",
+        {"topic": "民诉", "question_count": 1, "exam_type": "章节练习", "question_types": ["short_answer"]},
+        user_id="u1",
+        session_id="s1",
+    )
+
+    score_payload = tools.execute(
+        "score_exam",
+        {"answers_text": "", "exam_session_id": exam_payload["exam_session_id"]},
+        user_id="u1",
+        session_id="s1",
+    )
+
+    assert called is False
+    assert score_payload["unanswered_count"] == 1
+    assert score_payload["details"][0]["classification"] == "unanswered"
+    assert score_payload["details"][0]["score"] == 0
+
+
+def test_generate_exam_filters_misclassified_case_rows_and_normalizes_fact_only_case_prompt(tmp_path: Path):
+    tools = _build_custom_tools(
+        tmp_path,
+        [
+            {
+                "question_id": "bad-case-1",
+                "topic": "行政法",
+                "question": "什么是国家赔偿？",
+                "question_type": "case_analysis",
+                "evaluation_mode": "llm_subjective",
+                "reference_answer": "国家赔偿是国家机关违法行使职权造成损害时依法承担的赔偿责任。",
+                "answer": "国家赔偿是国家机关违法行使职权造成损害时依法承担的赔偿责任。",
+                "analysis": "应先说明国家赔偿的定义，再说明赔偿义务机关。",
+                "tags": ["行政法", "国家赔偿法"],
+                "source_metadata": {"task_family": "legal_question_answering"},
+                "score": 20,
+            },
+            {
+                "question_id": "good-case-1",
+                "topic": "刑法",
+                "question": "二、2016年4月23日早上，被告人邹1某和伙同他人再次到果园砍伐果树，共毁坏果树100株。",
+                "question_type": "case_analysis",
+                "evaluation_mode": "llm_subjective",
+                "reference_answer": "应结合毁坏数量、主观故意和共同犯罪情节分析是否构成故意毁坏财物罪。",
+                "answer": "应结合毁坏数量、主观故意和共同犯罪情节分析是否构成故意毁坏财物罪。",
+                "analysis": "需要围绕毁坏财物数额、行为方式和共同故意展开论证。",
+                "tags": ["刑法", "案例分析题"],
+                "source_metadata": {"task_family": "jud_read_compre"},
+                "score": 20,
+            },
+        ],
+    )
+
+    exam_payload = tools.execute(
+        "generate_exam",
+        {"topic": "综合", "question_count": 2, "exam_type": "综合练习", "question_types": ["case_analysis"]},
+        user_id="u1",
+        session_id="s1",
+    )
+
+    assert exam_payload["question_count"] == 1
+    assert exam_payload["questions"][0]["record_id"] == "good-case-1"
+    assert exam_payload["questions"][0]["question"].startswith("请阅读以下案情，结合法律规定进行案例分析并作答：")
+    assert "什么是国家赔偿？" not in exam_payload["questions"][0]["question"]
+
+
+def test_generate_exam_defaults_to_mixed_question_types(tmp_path: Path):
+    tools = _build_custom_tools(
+        tmp_path,
+        [
+            {
+                "question_id": "mix-1",
+                "topic": "综合",
+                "question": "下列关于民事诉讼上诉期限的说法，哪一项是正确的？",
+                "options": {
+                    "A": "判决书上诉期限通常为10日。",
+                    "B": "判决书上诉期限通常为15日。",
+                    "C": "裁定书上诉期限通常为15日。",
+                    "D": "一审判决一律不得上诉。",
+                },
+                "answer": "B",
+                "analysis": "对一审判决不服的，上诉期限通常为15日。",
+                "tags": ["民诉"],
+                "score": 20,
+            },
+            {
+                "question_id": "mix-2",
+                "topic": "综合",
+                "question": "简述行政处罚中听证程序的核心保障。",
+                "reference_answer": "应保障告知、陈述申辩和依法举行听证等程序权利。",
+                "answer": "应保障告知、陈述申辩和依法举行听证等程序权利。",
+                "analysis": "核心在于保障相对人的程序参与权与救济权。",
+                "question_type": "short_answer",
+                "tags": ["行政法"],
+                "score": 20,
+            },
+            {
+                "question_id": "mix-3",
+                "topic": "综合",
+                "question": "请阅读以下案情，结合法律规定进行案例分析并作答：\n甲公司与乙公司签订买卖合同后，乙公司迟延交货并造成甲公司停产损失。请分析乙公司的责任承担。",
+                "reference_answer": "应结合违约责任、损失范围和可得利益等规则分析。",
+                "answer": "应结合违约责任、损失范围和可得利益等规则分析。",
+                "analysis": "应围绕违约责任成立、损失赔偿范围和减损义务展开。",
+                "question_type": "case_analysis",
+                "tags": ["民法"],
+                "score": 20,
+            },
+        ],
+    )
+
+    exam_payload = tools.execute(
+        "generate_exam",
+        {"topic": "综合", "question_count": 3, "exam_type": "综合练习"},
+        user_id="u1",
+        session_id="s1",
+    )
+
+    assert exam_payload["question_types"] == ["single_choice", "short_answer", "case_analysis"]
+    assert {question["question_type"] for question in exam_payload["questions"]} == {"single_choice", "short_answer", "case_analysis"}
+
+
+def test_non_weak_exam_avoids_wrong_question_bank_replay(tmp_path: Path):
+    tools = _build_custom_tools(
+        tmp_path,
+        [
+            {
+                "question_id": "wrong-1",
+                "topic": "行政法",
+                "question": "行政处罚作出前，行政机关通常应先保障当事人的哪项权利？",
+                "options": {
+                    "A": "陈述申辩权",
+                    "B": "随意处分权",
+                    "C": "当然豁免权",
+                    "D": "无限延期权",
+                },
+                "answer": "A",
+                "analysis": "行政处罚作出前通常应保障陈述申辩等程序权利。",
+                "tags": ["行政法", "听证程序"],
+                "score": 20,
+            },
+            {
+                "question_id": "fresh-2",
+                "topic": "行政法",
+                "question": "行政许可申请材料不齐全时，行政机关通常应如何处理？",
+                "options": {
+                    "A": "直接驳回，且无需说明",
+                    "B": "一次性告知需要补正的全部内容",
+                    "C": "永远不得再次申请",
+                    "D": "只能口头通知，不得书面说明",
+                },
+                "answer": "B",
+                "analysis": "材料不齐全时，通常应一次性告知申请人需要补正的全部内容。",
+                "tags": ["行政法", "行政许可"],
+                "score": 20,
+            },
+        ],
+    )
+
+    first_exam = tools.execute(
+        "generate_exam",
+        {"topic": "行政法", "question_count": 1, "exam_type": "章节练习", "question_types": ["single_choice"]},
+        user_id="u1",
+        session_id="s1",
+    )
+    first_question = first_exam["questions"][0]
+    wrong_answer = next(choice for choice in ("A", "B", "C", "D") if choice != str(first_question["answer"]).upper())
+    tools.execute(
+        "score_exam",
+        {"answers_text": f"1.{wrong_answer}"},
+        user_id="u1",
+        session_id="s1",
+    )
+
+    second_exam = tools.execute(
+        "generate_exam",
+        {"topic": "行政法", "question_count": 1, "exam_type": "综合练习", "question_types": ["single_choice"]},
+        user_id="u1",
+        session_id="s1",
+    )
+
+    assert second_exam["reused_wrong_question_count"] == 0
+    assert second_exam["questions"][0]["record_id"] != first_question["record_id"]
+    assert any("避开错题库回放" in note for note in second_exam["selection_notes"])

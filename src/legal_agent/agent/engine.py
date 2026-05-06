@@ -265,6 +265,8 @@ class LegalAgentEngine:
             "recommended_next_step": analysis.get("recommended_next_step", "unknown"),
             "intent": analysis.get("intent", "legal_qa"),
             "intent_confidence": analysis.get("intent_confidence", 0.0),
+            "should_ask_user": analysis.get("should_ask_user", False),
+            "clarification_priority": analysis.get("clarification_priority", "none"),
             "should_stop_current_task": analysis.get("should_stop_current_task", False),
             "clarification_question": analysis.get("clarification_question"),
             "is_domain_switch": analysis.get("is_domain_switch", False),
@@ -355,6 +357,8 @@ class LegalAgentEngine:
             "preferred_answer_style": "brief_direct" if len(root_question) <= 80 else "structured_explanation",
             "likely_missing_info": [],
             "recommended_next_step": "unknown",
+            "should_ask_user": False,
+            "clarification_priority": "none",
         }
 
     def _analyze_user_turn(self, question: str, history: list[tuple[str, str]]) -> dict[str, Any]:
@@ -423,8 +427,62 @@ class LegalAgentEngine:
             f"- 是否要求精确结果：{'是' if analysis.get('requires_precise_result') else '否'}\n"
             f"- 建议回答风格：{analysis.get('preferred_answer_style', 'brief_direct')}\n"
             f"- 可能仍缺的信息：{missing_text}\n"
+            f"- 是否应优先追问：{'是' if analysis.get('should_ask_user') else '否'}\n"
+            f"- 追问优先级：{analysis.get('clarification_priority', 'none')}\n"
             f"- 当前建议优先动作：{analysis.get('recommended_next_step', 'unknown')}"
         )
+
+    def _tool_already_used(self, state: dict[str, Any], tool_name: str) -> bool:
+        return any(str(item.get("tool_name") or "") == tool_name for item in state.get("tool_history", []))
+
+    def _fallback_tool_from_turn_analysis(self, state: dict[str, Any]) -> ParsedStep | None:
+        analysis = dict(state.get("turn_analysis") or {})
+        recommended_next_step = str(analysis.get("recommended_next_step") or "").strip()
+        current_input_role = str(analysis.get("current_input_role") or "").strip()
+        has_followup_answer = current_input_role in {"supplement", "answer_to_followup", "correction"} and self._has_meaningful_followup_answer(state)
+        query = self._build_retrieval_query_from_state(state)
+
+        candidate_tools: list[str] = []
+        if recommended_next_step in {"prepare_context", "rag_search", "retrieve_from_kb"}:
+            candidate_tools.extend([recommended_next_step, "prepare_context", "rag_search", "retrieve_from_kb"])
+        elif str(analysis.get("intent") or "").strip() == "legal_qa":
+            candidate_tools.extend(["prepare_context", "rag_search", "retrieve_from_kb"])
+        if has_followup_answer:
+            candidate_tools.extend(["prepare_context", "rag_search", "retrieve_from_kb"])
+
+        for tool_name in dict.fromkeys(candidate_tools):
+            if tool_name == "prepare_context":
+                if self._tool_already_used(state, "prepare_context"):
+                    continue
+                return ParsedStep(
+                    kind="tool",
+                    thought="当前事实已足够先整理上下文，再继续检索和分析。",
+                    tool_name="prepare_context",
+                    tool_args={"query": query},
+                )
+            if tool_name == "rag_search":
+                if self._tool_already_used(state, "rag_search"):
+                    continue
+                return ParsedStep(
+                    kind="tool",
+                    thought="当前缺口不足以继续追问，先基于现有问题检索学习资料和案例。",
+                    tool_name="rag_search",
+                    tool_args={"query": query, "top_k": 6},
+                )
+            if tool_name == "retrieve_from_kb":
+                return ParsedStep(
+                    kind="tool",
+                    thought="当前缺口不足以继续追问，先基于现有事实检索法规依据。",
+                    tool_name="retrieve_from_kb",
+                    tool_args={"query": query, "top_k": 6},
+                )
+        return None
+
+    def _redirect_unnecessary_ask_user(self, state: dict[str, Any]) -> ParsedStep | None:
+        analysis = dict(state.get("turn_analysis") or {})
+        if bool(analysis.get("should_ask_user")):
+            return None
+        return self._fallback_tool_from_turn_analysis(state)
 
     def _compact_text_for_retrieval(self, text: str) -> str:
         raw = str(text or "").strip()
@@ -619,6 +677,10 @@ class LegalAgentEngine:
     def _normalize_clarification_question(self, question: str) -> str:
         normalized = "\n".join(line.strip() for line in str(question or "").splitlines() if line.strip())
         normalized = normalized.strip()
+        if normalized:
+            parsed_question = self._extract_embedded_question_text(normalized)
+            if parsed_question:
+                normalized = parsed_question
         if not normalized:
             return "请补充当前最影响结论的一项关键信息。"
         if normalized.endswith(("。", "？", "?", "！", "!")):
@@ -626,6 +688,37 @@ class LegalAgentEngine:
         if normalized.startswith(("请", "是否", "有无", "能否", "哪一", "哪种", "何时", "多少", "几")):
             return normalized + "？"
         return normalized + "。"
+
+    def _extract_embedded_question_text(self, text: str) -> str:
+        normalized = str(text or "").strip().strip("{}")
+        if not normalized:
+            return ""
+
+        payload = self._parse_json_object(text)
+        if isinstance(payload, dict):
+            question = str(payload.get("question") or "").strip()
+            if question:
+                return question
+
+        patterns = (
+            r'question\s*[:：=]\s*"([^"]+)"',
+            r"question\s*[:：=]\s*'([^']+)'",
+            r'question\s*[:：=]\s*“([^”]+)”',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, normalized, flags=re.I)
+            if match:
+                return match.group(1).strip()
+
+        for separator in (", field_name", "，field_name", " field_name"):
+            if separator in normalized:
+                normalized = normalized.split(separator, maxsplit=1)[0].strip().rstrip(",，;；")
+
+        if normalized.lower().startswith("question"):
+            normalized = re.sub(r"^question\s*[:：=]\s*", "", normalized, flags=re.I).strip()
+            normalized = normalized.strip('"\'“”')
+
+        return normalized.strip()
 
     def _answer_looks_like_statute_dump(self, answer: str) -> bool:
         text = str(answer or "").strip()
@@ -649,7 +742,7 @@ class LegalAgentEngine:
 
     def _has_contextual_retrieval_evidence(self, state: dict[str, Any]) -> bool:
         tool_names = {str(item.get("tool_name") or "") for item in state.get("tool_history", [])}
-        return bool(tool_names & {"retrieve_from_kb", "lookup_statute", "calculator"})
+        return bool(tool_names & {"rag_search", "retrieve_from_kb", "lookup_statute", "calculator"})
 
     def _should_skip_precise_result_review(self, state: dict[str, Any], answer: str) -> bool:
         if not self._clarification_questions(state) or not self._has_meaningful_followup_answer(state):
@@ -957,6 +1050,10 @@ class LegalAgentEngine:
                 final_answer=self._synthesize_final_answer(state, "补充事实后已完成检索，不再继续追加新的澄清问题"),
             )
 
+        redirected_step = self._redirect_unnecessary_ask_user(state)
+        if redirected_step is not None:
+            return redirected_step
+
         return parsed
 
     def _synthesize_final_answer(self, state: dict[str, Any], reason: str) -> str:
@@ -1021,6 +1118,12 @@ class LegalAgentEngine:
         return "\n".join(lines)
 
     def _apply_parsed_step(self, state: dict[str, Any], parsed: ParsedStep, raw_output: str) -> dict[str, Any]:
+        if parsed.kind not in {"tool", "final"}:
+            fallback_step = self._fallback_tool_from_turn_analysis(state)
+            if fallback_step is not None:
+                fallback_step.thought = parsed.thought or fallback_step.thought
+                parsed = fallback_step
+
         parsed = self._postprocess_parsed_step(state, parsed)
         scratchpad = state.get("scratchpad", "")
         new_state = dict(state)

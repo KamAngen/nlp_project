@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from hashlib import blake2b
 from pathlib import Path
 import random
 import json
+import re
 from typing import Iterable, List, Dict, Any, Set
 
-from legal_agent.utils.text import simple_tokenize, truncate_text
+from legal_agent.utils.text import clean_text, simple_tokenize, truncate_text
 from rag_engine.loaders import load_case_bank, load_common_knowledge, load_question_bank
 from rag_engine.schema import KnowledgeHit, KnowledgeRecord
 from rag_engine.embedding import EmbeddingEngine
@@ -44,6 +46,60 @@ CONTEXT_DEPENDENT_QUESTION_SNIPPETS = (
     "以上背景",
     "以上材料",
 )
+CASE_ANALYSIS_ACTION_HINTS = (
+    "请阅读以下案情",
+    "请根据以下案情",
+    "请结合以下案情",
+    "请结合案情",
+    "请分析",
+    "请说明理由",
+    "结合法律规定",
+    "推理出以下案件中的判决",
+    "推断案件判决",
+    "判决结果",
+    "裁判结果",
+    "如何处理",
+    "如何认定",
+    "如何定性",
+    "是否构成",
+    "是否违法",
+    "应承担",
+    "争议焦点",
+    "法律后果",
+    "应如何",
+    "何罪",
+)
+CASE_ANALYSIS_FACT_HINTS = (
+    "案情",
+    "本案",
+    "被告人",
+    "原告",
+    "被告",
+    "上诉人",
+    "被上诉人",
+    "申请人",
+    "被申请人",
+    "人民检察院指控",
+    "法院经审理查明",
+    "甲公司",
+    "乙公司",
+    "某公司",
+    "某企业",
+    "某厂",
+    "某村",
+    "某县",
+    "某市",
+)
+CASE_ANALYSIS_FACT_RE = re.compile(r"(?:19|20)\d{2}年|甲[乙丙丁]|乙[方人]|丙[方人]|丁[方人]")
+CASE_ANALYSIS_LEADING_ENUM_RE = re.compile(r"^(?:第?[一二三四五六七八九十百]+[、.．)]|\d+[、.．)])\s*")
+CASE_ANALYSIS_PROMPT_BY_TASK_FAMILY = {
+    "judgement_predit": "请阅读以下案情，推断案件判决结果并说明理由：",
+    "jud_doc_sum": "请阅读以下案情，概括案件要点并结合法律规定作答：",
+    "leg_case_cls": "请阅读以下案情，判断其所属法律问题并说明理由：",
+    "sim_case_match": "请阅读以下案情，分析其法律争点并作答：",
+    "jud_read_compre": "请阅读以下案情，结合法律规定进行案例分析并作答：",
+}
+COMPARISON_NORMALIZE_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
 
 
 class LegacyStatuteRetrieverAdapter:
@@ -109,6 +165,12 @@ class KnowledgeService:
         self.question_bank = load_question_bank(question_bank_path)
         self.case_bank = load_case_bank(case_bank_path)
         self.common_knowledge = load_common_knowledge(common_knowledge_path)
+        self._usable_question_bank: list[KnowledgeRecord] = []
+        self._usable_question_type_index: dict[str, list[KnowledgeRecord]] = {}
+        self._usable_question_loose_topic_index: dict[str, list[KnowledgeRecord]] = {}
+        self._usable_question_strict_topic_index: dict[str, list[KnowledgeRecord]] = {}
+        self._usable_question_loose_topic_type_index: dict[tuple[str, str], list[KnowledgeRecord]] = {}
+        self._usable_question_strict_topic_type_index: dict[tuple[str, str], list[KnowledgeRecord]] = {}
         self.legacy_statute = None
         if use_legacy_statute_rag and legacy_config_path is not None:
             self.legacy_statute = LegacyStatuteRetrieverAdapter(legacy_config_path, device=legacy_device)
@@ -117,6 +179,7 @@ class KnowledgeService:
         self.embedding_engine: EmbeddingEngine | None = None
         self.reranker_engine: RerankerEngine | None = None
         self.graph: LegalKnowledgeGraph | None = None
+        self._build_question_indexes()
 
     def load_indices(self, index_root_path: str | Path, model_path: str | Path, device: str | None = None):
         self.embedding_engine = EmbeddingEngine(model_path, device=device)
@@ -225,6 +288,9 @@ class KnowledgeService:
             if persist:
                 self.graph.save("data/indices/legal_graph.json")
 
+        if record.source_type == "question_bank":
+            self._build_question_indexes()
+
         # 4. Persist to JSONL
         if persist:
             bank_path = {
@@ -266,7 +332,6 @@ class KnowledgeService:
                     f.write(json.dumps(legacy_dict, ensure_ascii=False) + "\n")
 
     def update_records_batch(self, records: List[KnowledgeRecord], persist: bool = True):
-        from collections import defaultdict
         grouped = defaultdict(list)
         for r in records:
             grouped[r.source_type].append(r)
@@ -324,6 +389,9 @@ class KnowledgeService:
                             else:
                                 legacy_dict = {"id": record.record_id, "title": record.title, "content": record.content, **record.metadata}
                             f.write(json.dumps(legacy_dict, ensure_ascii=False) + "\n")
+
+            if source_type == "question_bank":
+                self._build_question_indexes()
 
     def summary(self) -> dict[str, object]:
         topic_distribution: dict[str, int] = {}
@@ -413,72 +481,153 @@ class KnowledgeService:
         preferred_tags: list[str] | None = None,
         exam_type: str | None = None,
         avoid_question_ids: list[str] | None = None,
+        prioritized_question_ids: list[str] | None = None,
+        strong_tags: list[str] | None = None,
+        random_seed: int | None = None,
         user_mastery_level: float = 0.5,
     ) -> list[KnowledgeRecord]:
-        rng = random.Random()
-        effective_exam_type = exam_type or "综合练习"
-        avoid_ids = set(avoid_question_ids or [])
-        mastered_tags = [] 
-        prioritized_ids = set() 
-
-        # 1. Hybrid Retrieval for Candidate Pool (Lexical + Semantic RRF Fusion)
-        if topic and topic != "综合":
-            K = 60  # RRF constant
-
-            # 1a. Lexical search
-            lexical_hits = self._search_lexical_records(
-                topic, self.question_bank, top_k=50
-            )
-            # 1b. Semantic search
-            semantic_hits = self._search_embedding_records(
-                topic, self.question_bank, source_type="question_bank", top_k=50
-            )
-
-            # 1c. RRF fusion: merge by record_id
-            rrf_scores: dict[str, float] = {}
-            for rank, h in enumerate(lexical_hits):
-                rrf_scores[h.record_id] = rrf_scores.get(h.record_id, 0.0) + 1.0 / (K + rank + 1)
-            for rank, h in enumerate(semantic_hits):
-                rrf_scores[h.record_id] = rrf_scores.get(h.record_id, 0.0) + 1.0 / (K + rank + 1)
-
-            # 1d. Build candidate pool sorted by RRF score (top 60)
-            sorted_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)[:60]
-            candidate_pool = []
-            for rid in sorted_ids:
-                rec = self.get_record_by_id(rid)
-                if rec:
-                    rec.metadata["_semantic_score"] = rrf_scores[rid] * 30  # scale to ~0-1
-                    candidate_pool.append(rec)
-
-            # Fallback only if the specific topic has zero results
-            if not candidate_pool:
-                candidate_pool = list(self.question_bank)
-        else:
-            candidate_pool = list(self.question_bank)
-
-        # 2. Filter out avoid_ids
-        candidate_pool = [r for r in candidate_pool if r.record_id not in avoid_ids]
-
-        # 3. Weighted Sampling from the pool
-        # This will respect both the topic (via the pool) and the difficulty (via weighting)
-        selected = self._weighted_sample_without_replacement(
-            candidate_pool,
-            min(len(candidate_pool), question_count),
-            rng,
-            weight_fn=lambda record: self._question_weight(
-                record,
-                topic=topic,
-                preferred_tags=preferred_tags or [],
-                exam_type=effective_exam_type,
-                avoid_ids=avoid_ids,
-                prioritized_ids=prioritized_ids,
-                strong_tags=mastered_tags,
-                user_mastery_level=user_mastery_level,
-            ),
+        preferred_tags = [str(tag) for tag in preferred_tags or [] if str(tag).strip()]
+        avoid_ids = {str(record_id) for record_id in avoid_question_ids or [] if str(record_id).strip()}
+        prioritized_ids = {str(record_id) for record_id in prioritized_question_ids or [] if str(record_id).strip()}
+        mastered_tags = [str(tag) for tag in strong_tags or [] if str(tag).strip()]
+        effective_exam_type = str(exam_type or "综合练习").strip() or "综合练习"
+        rng = random.Random(random_seed)
+        normalized_topic = self._normalize_topic_name(topic)
+        normalized_question_types = self._normalize_question_types(question_types)
+        strict_topic = bool(
+            normalized_topic
+            and normalized_topic != "综合"
+            and effective_exam_type in {"章节练习", "薄弱点强化", "真题模拟"}
         )
 
+        question_pool = self._question_pool_from_index(normalized_question_types)
+        if normalized_topic and normalized_topic != "综合":
+            topic_hits = self._question_pool_from_index(
+                normalized_question_types,
+                topic=normalized_topic,
+                strict=strict_topic,
+            )
+            if strict_topic:
+                pool = topic_hits
+            else:
+                pool = topic_hits or question_pool
+        else:
+            pool = question_pool
+
+        if strict_topic and not pool:
+            return []
+        if not pool:
+            return []
+
+        candidate_pool = list(pool)
+        if normalized_topic and normalized_topic != "综合":
+            rrf_scores: dict[str, float] = {}
+            lexical_hits = self._search_lexical_records(normalized_topic, self.question_bank, top_k=80)
+            semantic_hits = self._search_embedding_records(normalized_topic, self.question_bank, source_type="question_bank", top_k=80)
+            allowed_ids = {record.record_id for record in pool}
+            fusion_k = 60
+            for rank, hit in enumerate(lexical_hits):
+                if hit.record_id not in allowed_ids:
+                    continue
+                rrf_scores[hit.record_id] = rrf_scores.get(hit.record_id, 0.0) + 1.0 / (fusion_k + rank + 1)
+            for rank, hit in enumerate(semantic_hits):
+                if hit.record_id not in allowed_ids:
+                    continue
+                rrf_scores[hit.record_id] = rrf_scores.get(hit.record_id, 0.0) + 1.0 / (fusion_k + rank + 1)
+            if rrf_scores:
+                ranked_ids = sorted(rrf_scores, key=lambda item: rrf_scores[item], reverse=True)
+                candidate_pool = []
+                seen_ids: set[str] = set()
+                for record_id in ranked_ids:
+                    record = self.get_record_by_id(record_id)
+                    if record is None or record.record_id not in allowed_ids or record.record_id in seen_ids:
+                        continue
+                    record.metadata["_semantic_score"] = max(float(record.metadata.get("_semantic_score") or 0.0), rrf_scores[record_id] * 30)
+                    candidate_pool.append(record)
+                    seen_ids.add(record.record_id)
+                candidate_pool.extend(record for record in pool if record.record_id not in seen_ids)
+
+        priority_pool = [
+            record
+            for record in candidate_pool
+            if record.record_id in prioritized_ids
+            and (not normalized_topic or normalized_topic == "综合" or self._topic_matches(record, normalized_topic))
+        ]
+        if not priority_pool and prioritized_ids:
+            priority_pool = [record for record in question_pool if record.record_id in prioritized_ids]
+
+        selected: list[KnowledgeRecord] = []
+        priority_target = self._priority_question_target(effective_exam_type, question_count, len(priority_pool))
+        if priority_target > 0:
+            selected.extend(
+                self._weighted_sample_without_replacement(
+                    priority_pool,
+                    priority_target,
+                    rng,
+                    weight_fn=lambda record: self._question_weight(
+                        record,
+                        topic=normalized_topic or topic,
+                        preferred_tags=preferred_tags,
+                        exam_type=effective_exam_type,
+                        avoid_ids=set(),
+                        prioritized_ids=prioritized_ids,
+                        strong_tags=mastered_tags,
+                        user_mastery_level=user_mastery_level,
+                    ) + 2.4,
+                )
+            )
+
+        selected_ids = {record.record_id for record in selected}
+        candidate_pool = [record for record in candidate_pool if record.record_id not in selected_ids]
+
+        remaining = max(question_count - len(selected), 0)
+        if remaining > 0:
+            fresh_pool = [record for record in candidate_pool if record.record_id not in avoid_ids]
+            if len(fresh_pool) >= remaining:
+                candidate_pool = fresh_pool
+            selected.extend(
+                self._weighted_sample_without_replacement(
+                    candidate_pool,
+                    remaining,
+                    rng,
+                    weight_fn=lambda record: self._question_weight(
+                        record,
+                        topic=normalized_topic or topic,
+                        preferred_tags=preferred_tags,
+                        exam_type=effective_exam_type,
+                        avoid_ids=avoid_ids,
+                        prioritized_ids=prioritized_ids,
+                        strong_tags=mastered_tags,
+                        user_mastery_level=user_mastery_level,
+                    ),
+                )
+            )
+
+        selected_ids = {record.record_id for record in selected}
+        remaining = max(question_count - len(selected), 0)
+        if remaining > 0:
+            fallback_source = pool if strict_topic else question_pool
+            fallback_pool = [record for record in fallback_source if record.record_id not in selected_ids]
+            selected.extend(
+                self._weighted_sample_without_replacement(
+                    fallback_pool,
+                    remaining,
+                    rng,
+                    weight_fn=lambda record: self._question_weight(
+                        record,
+                        topic=normalized_topic or topic,
+                        preferred_tags=preferred_tags,
+                        exam_type=effective_exam_type,
+                        avoid_ids=set(),
+                        prioritized_ids=prioritized_ids,
+                        strong_tags=mastered_tags,
+                        user_mastery_level=user_mastery_level,
+                    ),
+                )
+            )
+
         rng.shuffle(selected)
-        return selected
+        return selected[:question_count]
 
     def build_exam_questions(
         self,
@@ -507,6 +656,73 @@ class KnowledgeService:
             notes.append(f"本次试卷题型构成：{'，'.join(fragments)}。")
         return questions, notes
 
+    def _build_question_indexes(self) -> None:
+        usable_question_bank: list[KnowledgeRecord] = []
+        by_type: dict[str, list[KnowledgeRecord]] = defaultdict(list)
+        loose_topic_index: dict[str, list[KnowledgeRecord]] = defaultdict(list)
+        strict_topic_index: dict[str, list[KnowledgeRecord]] = defaultdict(list)
+        loose_topic_type_index: dict[tuple[str, str], list[KnowledgeRecord]] = defaultdict(list)
+        strict_topic_type_index: dict[tuple[str, str], list[KnowledgeRecord]] = defaultdict(list)
+
+        for record in self.question_bank:
+            if not self._is_usable_exam_record(record):
+                continue
+            usable_question_bank.append(record)
+            question_type = self._question_type(record)
+            by_type[question_type].append(record)
+
+            primary_topic = self._primary_topic(record)
+            tag_topics = {
+                normalized
+                for tag in record.tags
+                for normalized in [self._normalize_topic_name(str(tag or "").strip())]
+                if normalized in CANONICAL_TOPICS and normalized != "综合"
+            }
+            loose_topics = set(tag_topics)
+            strict_topics: set[str] = set()
+            if primary_topic and primary_topic != "综合":
+                loose_topics.add(primary_topic)
+                strict_topics.add(primary_topic)
+
+            for topic_name in loose_topics:
+                loose_topic_index[topic_name].append(record)
+                loose_topic_type_index[(topic_name, question_type)].append(record)
+            for topic_name in strict_topics:
+                strict_topic_index[topic_name].append(record)
+                strict_topic_type_index[(topic_name, question_type)].append(record)
+
+        self._usable_question_bank = usable_question_bank
+        self._usable_question_type_index = dict(by_type)
+        self._usable_question_loose_topic_index = dict(loose_topic_index)
+        self._usable_question_strict_topic_index = dict(strict_topic_index)
+        self._usable_question_loose_topic_type_index = dict(loose_topic_type_index)
+        self._usable_question_strict_topic_type_index = dict(strict_topic_type_index)
+
+    def _question_pool_from_index(
+        self,
+        question_types: list[str],
+        *,
+        topic: str | None = None,
+        strict: bool = False,
+    ) -> list[KnowledgeRecord]:
+        normalized_topic = self._normalize_topic_name(topic)
+        if normalized_topic and normalized_topic != "综合":
+            if question_types:
+                index = self._usable_question_strict_topic_type_index if strict else self._usable_question_loose_topic_type_index
+                pooled: list[KnowledgeRecord] = []
+                for question_type in question_types:
+                    pooled.extend(index.get((normalized_topic, question_type), []))
+                return self._dedupe_records(pooled)
+            topic_index = self._usable_question_strict_topic_index if strict else self._usable_question_loose_topic_index
+            return list(topic_index.get(normalized_topic, []))
+
+        if question_types:
+            pooled = []
+            for question_type in question_types:
+                pooled.extend(self._usable_question_type_index.get(question_type, []))
+            return self._dedupe_records(pooled)
+        return list(self._usable_question_bank)
+
     def _priority_question_target(self, exam_type: str, question_count: int, priority_count: int) -> int:
         if priority_count <= 0 or question_count <= 0:
             return 0
@@ -533,32 +749,23 @@ class KnowledgeService:
     ) -> float:
         weight = 1.0
         tag_bonus = sum(1 for tag in preferred_tags if self._topic_matches(record, tag))
-        topic_match = bool(topic and topic != "综合" and self._topic_matches(record, topic))
         strict_topic_quality = self._strict_topic_quality(record, topic or "") if topic and topic != "综合" else 0
         difficulty = str(record.difficulty or "medium")
-        
-        # Curriculum Sampling Logic
+
         multiplier = 1.0
         if user_mastery_level < 0.35:
-            # Beginner: Strongly favor easy > medium > hard
             multiplier = {"easy": 100.0, "medium": 30.0, "hard": 1.0}.get(difficulty, 1.0)
         elif user_mastery_level < 0.75:
-            # Intermediate: favor medium
             multiplier = {"easy": 5.0, "medium": 20.0, "hard": 5.0}.get(difficulty, 1.0)
         else:
-            # Advanced: Strongly favor hard
             multiplier = {"easy": 0.1, "medium": 2.0, "hard": 50.0}.get(difficulty, 1.0)
-
         weight *= multiplier
 
-        # Semantic Score Bonus (Priority over Keyword match)
-        semantic_score = record.metadata.get("_semantic_score", 0.0)
-        if semantic_score > 0.5: # Only apply significant boost for decent matches
-            weight *= (1.0 + (semantic_score - 0.5) * 5.0)
-        
-        # Legacy Keyword match (Still useful as a secondary signal)
-        topic_match = bool(topic and topic != "综合" and self._topic_matches(record, topic))
-        if topic_match:
+        semantic_score = float(record.metadata.get("_semantic_score") or 0.0)
+        if semantic_score > 0.5:
+            weight *= 1.0 + (semantic_score - 0.5) * 5.0
+
+        if topic and topic != "综合" and self._topic_matches(record, topic):
             weight *= 1.5
 
         weight += tag_bonus * (1.4 if exam_type == "薄弱点强化" else 0.9)
@@ -641,9 +848,8 @@ class KnowledgeService:
     def _search_embedding_records(self, query: str, records: list[KnowledgeRecord], *, source_type: str, top_k: int) -> list[KnowledgeHit]:
         index = self.indices.get(source_type)
         if not index:
-            # Fallback to lexical if index missing
             return self._search_lexical_records(query, records, top_k=top_k)
-            
+
         results = index.search(query, top_k=top_k)
         hits = []
         for res in results:
@@ -661,28 +867,220 @@ class KnowledgeService:
         return hits
 
     def _topic_matches(self, record: KnowledgeRecord, topic: str) -> bool:
-        target = str(topic or "").strip().lower()
+        return self._record_matches_topic(record, topic, strict=False)
+
+    def _record_matches_topic(self, record: KnowledgeRecord, topic: str, *, strict: bool) -> bool:
+        target = self._normalize_topic_name(topic)
         if not target:
             return False
-            
-        # 1. Check Tags (Exact match)
-        if any(target in str(tag).lower() for tag in record.tags):
+        if target == "综合":
             return True
-            
-        # 2. Check Title and Content (Substring match for robustness in Chinese)
-        if target in record.title.lower() or target in record.content.lower():
-            return True
-            
-        return False
+        if strict:
+            return self._strict_topic_quality(record, target) >= 2
+        return self._strict_topic_quality(record, target) > 0
 
-    def _priority_question_target(self, exam_type: str, question_count: int, priority_count: int) -> int:
-        if priority_count <= 0 or question_count <= 0:
+    def _normalize_topic_name(self, topic: str | None) -> str:
+        value = str(topic or "").strip()
+        if not value:
+            return ""
+        for canonical, aliases in TOPIC_QUERY_ALIASES.items():
+            if value == canonical or value in aliases:
+                return canonical
+        return value
+
+    def _normalize_question_types(self, question_types: list[str] | None) -> list[str]:
+        normalized: list[str] = []
+        for raw in question_types or []:
+            value = str(raw or "").strip()
+            if not value:
+                continue
+            for canonical, aliases in QUESTION_TYPE_ALIASES.items():
+                if value == canonical or value in aliases:
+                    if canonical not in normalized:
+                        normalized.append(canonical)
+                    break
+            else:
+                if value not in normalized:
+                    normalized.append(value)
+        return normalized
+
+    def _primary_topic(self, record: KnowledgeRecord) -> str | None:
+        metadata_topic = self._normalize_topic_name(str(record.metadata.get("topic") or "").strip())
+        if metadata_topic in CANONICAL_TOPICS:
+            return metadata_topic
+        for tag in record.tags:
+            value = self._normalize_topic_name(str(tag or "").strip())
+            if value in CANONICAL_TOPICS:
+                return value
+        return None
+
+    def _question_type(self, record: KnowledgeRecord) -> str:
+        value = str(record.metadata.get("question_type") or "").strip()
+        if value:
+            return value
+        return "single_choice" if dict(record.metadata.get("options") or {}) else "short_answer"
+
+    def _strict_topic_quality(self, record: KnowledgeRecord, topic: str) -> int:
+        target = self._normalize_topic_name(topic)
+        if not target:
             return 0
-        ratio = {
-            "薄弱点强化": 0.7,
-            "章节练习": 0.45,
-            "真题模拟": 0.25,
-            "综合练习": 0.35,
-        }.get(exam_type, 0.3)
-        target = max(1, round(question_count * ratio))
-        return min(priority_count, question_count, target)
+
+        primary_topic = self._primary_topic(record)
+        if primary_topic == target:
+            return 2
+        tag_topics = {
+            self._normalize_topic_name(tag)
+            for tag in record.tags
+            if self._normalize_topic_name(tag)
+        }
+        if target in tag_topics:
+            return 1
+        return 0
+
+    def _is_usable_exam_record(self, record: KnowledgeRecord) -> bool:
+        question_text = self._normalize_exam_question_text(record)
+        if not question_text or self._is_context_dependent_question(question_text):
+            return False
+        question_type = self._question_type(record)
+        if question_type == "single_choice":
+            options = self._normalize_options(record.metadata.get("options") or {})
+            answer = str(record.metadata.get("answer") or "").upper().strip()
+            return self._options_are_consistent(options, answer)
+        reference_answer = str(record.metadata.get("reference_answer") or record.metadata.get("answer") or "").strip()
+        analysis = str(record.metadata.get("analysis") or "").strip()
+        return bool(reference_answer or analysis)
+
+    def _is_context_dependent_question(self, text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return True
+        return any(snippet in normalized for snippet in CONTEXT_DEPENDENT_QUESTION_SNIPPETS)
+
+    def _normalize_exam_question_text(self, record: KnowledgeRecord) -> str:
+        question_text = clean_text(str(record.title or ""))
+        if not question_text:
+            return ""
+        if self._question_type(record) != "case_analysis":
+            return question_text
+        if self._has_case_analysis_action(question_text):
+            return question_text
+        if not self._looks_like_case_fact_text(question_text):
+            return ""
+        task_family = self._source_task_family(record)
+        prompt = CASE_ANALYSIS_PROMPT_BY_TASK_FAMILY.get(task_family, "请阅读以下案情，结合法律规定进行案例分析并作答：")
+        facts = clean_text(CASE_ANALYSIS_LEADING_ENUM_RE.sub("", question_text))
+        if not facts:
+            return ""
+        return f"{prompt}\n{facts}"
+
+    def _source_task_family(self, record: KnowledgeRecord) -> str:
+        source_metadata = dict(record.metadata.get("source_metadata") or {})
+        return str(source_metadata.get("task_family") or "").strip()
+
+    def _has_case_analysis_action(self, text: str) -> bool:
+        cleaned = clean_text(text)
+        if not cleaned:
+            return False
+        return any(hint in cleaned for hint in CASE_ANALYSIS_ACTION_HINTS)
+
+    def _looks_like_case_fact_text(self, text: str) -> bool:
+        cleaned = clean_text(text)
+        if not cleaned:
+            return False
+        if any(hint in cleaned for hint in CASE_ANALYSIS_FACT_HINTS):
+            return True
+        return bool(CASE_ANALYSIS_FACT_RE.search(cleaned))
+
+    def _build_exam_question(
+        self,
+        record: KnowledgeRecord,
+        *,
+        index: int,
+        requested_topic: str | None,
+    ) -> dict[str, object] | None:
+        question_text = self._normalize_exam_question_text(record)
+        if not question_text or self._is_context_dependent_question(question_text):
+            return None
+
+        question_type = self._question_type(record)
+        base_payload = {
+            "index": index,
+            "record_id": record.record_id,
+            "topic": self._resolve_exam_topic(record, requested_topic=requested_topic),
+            "question_type": question_type,
+            "evaluation_mode": str(record.metadata.get("evaluation_mode") or ("objective_choice" if question_type == "single_choice" else "llm_subjective")),
+            "question": question_text,
+            "analysis": str(record.metadata.get("analysis") or "").strip(),
+            "tags": self._normalize_exam_tags(record, requested_topic=requested_topic),
+            "references": [str(item) for item in record.metadata.get("references", []) if str(item).strip()],
+            "score": int(record.metadata.get("score", 20)),
+        }
+        if question_type == "single_choice":
+            answer = str(record.metadata.get("answer") or "").upper().strip()
+            options = self._normalize_options(record.metadata.get("options") or {})
+            if not self._options_are_consistent(options, answer):
+                return None
+            return {
+                **base_payload,
+                "options": options,
+                "answer": answer,
+                "reference_answer": str(record.metadata.get("reference_answer") or options.get(answer) or "").strip(),
+            }
+
+        reference_answer = str(record.metadata.get("reference_answer") or record.metadata.get("answer") or "").strip()
+        if not reference_answer and not base_payload["analysis"]:
+            return None
+        return {
+            **base_payload,
+            "options": {},
+            "answer": reference_answer or base_payload["analysis"],
+            "reference_answer": reference_answer or base_payload["analysis"],
+        }
+
+    def _resolve_exam_topic(self, record: KnowledgeRecord, *, requested_topic: str | None) -> str:
+        target = self._normalize_topic_name(requested_topic)
+        primary_topic = self._primary_topic(record)
+        if target and target != "综合" and primary_topic == target:
+            return target
+        return primary_topic or target or "综合"
+
+    def _normalize_exam_tags(self, record: KnowledgeRecord, *, requested_topic: str | None) -> list[str]:
+        resolved_topic = self._resolve_exam_topic(record, requested_topic=requested_topic)
+        tags: list[str] = []
+        if resolved_topic:
+            tags.append(resolved_topic)
+        question_type = self._question_type(record)
+        if question_type not in tags:
+            tags.append(question_type)
+        for tag in record.tags:
+            value = str(tag or "").strip()
+            if not value:
+                continue
+            normalized_topic = self._normalize_topic_name(value)
+            if normalized_topic in CANONICAL_TOPICS and normalized_topic != resolved_topic:
+                continue
+            if value not in tags:
+                tags.append(value)
+        return tags
+
+    def _normalize_options(self, raw_options: object) -> dict[str, str]:
+        if not isinstance(raw_options, dict):
+            return {}
+        normalized: dict[str, str] = {}
+        for label in EXAM_OPTION_LABELS:
+            value = str(raw_options.get(label) or "").strip()
+            if value:
+                normalized[label] = value
+        return normalized
+
+    def _options_are_consistent(self, options: dict[str, str], answer: str) -> bool:
+        if set(options) != set(EXAM_OPTION_LABELS):
+            return False
+        if answer not in options:
+            return False
+        normalized_values = {self._comparison_key(text) for text in options.values() if self._comparison_key(text)}
+        return len(normalized_values) == len(EXAM_OPTION_LABELS)
+
+    def _comparison_key(self, text: str) -> str:
+        normalized = clean_text(str(text or "")).lower()
+        return COMPARISON_NORMALIZE_RE.sub("", normalized)

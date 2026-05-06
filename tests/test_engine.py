@@ -351,6 +351,121 @@ def test_followup_answer_after_retrieval_forces_final_synthesis_instead_of_new_a
     assert "当前信息仍不足以形成可靠法律结论" not in updated.final_answer
 
 
+def test_noncritical_ask_user_is_redirected_to_rag_search_after_followup_answer():
+    engine = _build_engine()
+    parsed = ParsedStep(
+        kind="tool",
+        thought="我还想继续追问一个细节。",
+        tool_name="ask_user",
+        tool_args={"question": "请再补充是否有人报警、是否有目击证人。", "field_name": "accident_more_details"},
+    )
+    state = {
+        "question": "交警认定对方全责，我已经花了2万元医疗费，误工30天。",
+        "history": [("交通事故大概能赔多少？", "请补充责任比例、医疗费和误工期。")],
+        "turn_analysis": {
+            "current_input_role": "answer_to_followup",
+            "recommended_next_step": "rag_search",
+            "should_ask_user": False,
+            "clarification_priority": "low",
+        },
+        "tool_history": [
+            {
+                "tool_name": "ask_user",
+                "tool_args": {"question": "请补充责任比例、医疗费和误工期。", "field_name": "accident_facts"},
+                "result": {"status": "pending_user_input"},
+            }
+        ],
+        "scratchpad": "Observation: 用户已经补充了责任比例、医疗费和误工期。",
+        "errors": [],
+        "step_count": 1,
+        "llm_retry_count": 0,
+    }
+
+    updated = engine._postprocess_parsed_step(state, parsed)
+
+    assert updated.kind == "tool"
+    assert updated.tool_name == "rag_search"
+    assert "交通事故大概能赔多少" in updated.tool_args["query"]
+    assert "2万元医疗费" in updated.tool_args["query"]
+
+
+def test_noncritical_ask_user_is_redirected_to_rag_search_after_prepare_context():
+    engine = _build_engine()
+    parsed = ParsedStep(
+        kind="tool",
+        thought="我还想先追问押金性质。",
+        tool_name="ask_user",
+        tool_args={"question": "押金的性质是什么？是否在合同中有明确约定？", "field_name": "deposit_type"},
+    )
+    state = {
+        "question": "押金到期不退怎么办？",
+        "history": [],
+        "turn_analysis": {
+            "current_input_role": "new_question",
+            "recommended_next_step": "prepare_context",
+            "should_ask_user": False,
+            "clarification_priority": "low",
+        },
+        "tool_history": [
+            {
+                "tool_name": "prepare_context",
+                "tool_args": {"query": "押金到期不退怎么办？"},
+                "result": {"planning_context": "示例上下文"},
+            }
+        ],
+        "scratchpad": "Observation: 已完成上下文整理。",
+        "errors": [],
+        "step_count": 1,
+        "llm_retry_count": 0,
+    }
+
+    updated = engine._postprocess_parsed_step(state, parsed)
+
+    assert updated.kind == "tool"
+    assert updated.tool_name == "rag_search"
+    assert "押金到期不退怎么办" in updated.tool_args["query"]
+
+
+def test_normalize_clarification_question_strips_embedded_tool_arg_dump():
+    engine = _build_engine()
+
+    normalized = engine._normalize_clarification_question(
+        'question: "押金的性质是什么？是否在合同中有明确约定？", field_name: "followup_facts_1"。'
+    )
+
+    assert normalized == "押金的性质是什么？是否在合同中有明确约定？"
+
+
+def test_invalid_llm_output_falls_back_to_turn_analysis_tool():
+    engine = _build_engine()
+    state = {
+        "question": "押金到期不退怎么办？",
+        "history": [],
+        "turn_analysis": {
+            "intent": "legal_qa",
+            "recommended_next_step": "prepare_context",
+            "should_ask_user": False,
+            "current_input_role": "new_question",
+        },
+        "scratchpad": "",
+        "tool_history": [],
+        "errors": [],
+        "step_count": 0,
+        "llm_retry_count": 0,
+    }
+    parsed = ParsedStep(
+        kind="invalid",
+        thought="需要先准备当前用户的上下文。",
+        error="模型输出中缺少 Action 或 Final Answer。",
+    )
+
+    updated = engine._apply_parsed_step(state, parsed, "Thought: 需要先准备当前用户的上下文。")
+
+    assert updated["parsed_kind"] == "tool"
+    assert updated["parsed_payload"]["tool_name"] == "prepare_context"
+    assert "押金到期不退怎么办" in updated["parsed_payload"]["tool_args"]["query"]
+
+
 def test_retrieval_query_uses_only_supplemental_answers_not_prior_questions():
     engine = _build_engine()
     question = (

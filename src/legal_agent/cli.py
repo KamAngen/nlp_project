@@ -152,6 +152,7 @@ def cmd_web_ui(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         retrieval_device=args.retrieval_device,
+        public=config.public,
     )
 
 
